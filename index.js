@@ -54,6 +54,20 @@ app.post("/whatsapp", async (req, res) => {
   console.log("WEBHOOK KOMMO RECEBIDO");
   console.log("HEADERS:", JSON.stringify(req.headers, null, 2));
   console.log("BODY:", JSON.stringify(req.body, null, 2));
+  // ===== LEITURA DEFENSIVA =====
+  const from =
+    req.body?.from ||
+    req.body?.sender?.id ||
+    req.body?.message?.from ||
+    req.body?.contact?.id ||
+    "unknown";
+
+  const texto =
+    req.body?.content?.text ||
+    req.body?.message?.text ||
+    req.body?.text ||
+    req.body?.body ||
+    "";
 
   // Responder rápido (evita timeout do Kommo)
   res.set("Content-Type", "application/json");
@@ -114,4 +128,5 @@ app.post("/whatsapp", async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => console.log("Agente rodando"));
+
 

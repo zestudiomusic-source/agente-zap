@@ -3,6 +3,9 @@ import express from "express";
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.get("/", (req, res) => {
+  res.status(200).send("OK - agente online");
+});
 
 app.post("/whatsapp", (req, res) => {
   const msg = req.body.Body;
@@ -19,3 +22,4 @@ app.post("/whatsapp", (req, res) => {
 app.listen(process.env.PORT || 3000, () =>
   console.log("Agente rodando")
 );
+

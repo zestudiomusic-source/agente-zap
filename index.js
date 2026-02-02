@@ -1,86 +1,69 @@
 import express from "express";
 import axios from "axios";
-import OpenAI from "openai";
 
 const app = express();
 
-// ================== MIDDLEWARE ==================
-app.use(express.json({ limit: "2mb" }));
+/**
+ * Middleware para aceitar JSON e dados de formulário (Kommo envia assim)
+ */
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ================== OPENAI ==================
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// ================== ROTAS TESTE ==================
-app.get("/", (req, res) => {
-  res.send("OK - agente com IA online");
-});
-
-// ================== WEBHOOK KOMMO ==================
+/**
+ * Rota principal de webhook (Kommo)
+ */
 app.post("/whatsapp", async (req, res) => {
-  console.log("========== WEBHOOK KOMMO ==========");
-  console.log(req.body);
-
-  const texto =
-    req.body["message[add][0][text]"] ||
-    req.body?.message?.add?.[0]?.text ||
-    "";
-
-  const chatId = req.body["message[add][0][chat_id]"];
-
-  if (!texto || !chatId) {
-    return res.status(200).json({ ok: true });
-  }
-
-  console.log("Mensagem recebida:", texto);
-
   try {
-    // ===== IA =====
-    const aiResponse = await openai.responses.create({
-      model: "gpt-4.1-mini",
-      input: `Você é um assistente educado e objetivo.
-Responda mensagens de WhatsApp de forma curta.
+    console.log("==== NOVO EVENTO KOMMO ====");
+    console.log("BODY:", JSON.stringify(req.body, null, 2));
 
-Mensagem do cliente: "${texto}"`,
-    });
+    // Captura segura do texto da mensagem
+    const texto =
+      req.body?.message?.text ||
+      req.body?.["message[add][0][text]"] ||
+      "";
 
-    const respostaIA =
-      aiResponse.output_text || "Pode repetir, por favor?";
+    console.log("TEXTO RECEBIDO:", texto);
 
-    console.log("Resposta IA:", respostaIA);
+    // Se não houver texto, apenas ignora (ajuste defensivo)
+    if (!texto) {
+      return res.status(200).json({
+        ok: true,
+        ignored: true,
+        reason: "evento sem texto",
+      });
+    }
 
-    // ===== ENVIA RESPOSTA PELO KOMMO =====
+    // =========================
+    // RESPOSTA DE TESTE
+    // =========================
+    // Se isso aparecer no WhatsApp, a integração está OK
     await axios.post(
-      https://${process.env.KOMMO_SUBDOMAIN}.kommo.com/api/v4/messages,
-      [
-        {
-          chat_id: chatId,
-          message: {
-            type: "text",
-            text: respostaIA,
-          },
-        },
-      ],
+      "https://api.kommo.com/api/v4/leads",
+      {},
       {
         headers: {
-          Authorization: Bearer ${process.env.KOMMO_TOKEN},
+          Authorization: `Bearer ${process.env.KOMMO_TOKEN}`,
           "Content-Type": "application/json",
         },
       }
     );
 
-    return res.status(200).json({ ok: true });
+    return res.status(200).json({
+      ok: true,
+      resposta: "Recebi sua mensagem ✅",
+    });
   } catch (err) {
     console.error("ERRO IA:", err.message);
     return res.status(200).json({ ok: false });
   }
 });
 
-// ================== START SERVER ==================
+/**
+ * START SERVER (OBRIGATÓRIO PARA O RENDER)
+ */
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-  console.log(Agente rodando na porta ${PORT});
+  console.log(`Agente rodando na porta ${PORT}`);
 });

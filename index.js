@@ -2,27 +2,24 @@ import express from "express";
 
 const app = express();
 
-// Kommo envia JSON
+// ================== MIDDLEWARE ==================
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// Rota raiz (health check)
+// ================== ROTAS DE TESTE ==================
 app.get("/", (req, res) => {
   res.status(200).send("OK - agente zap online");
 });
 
-// (opcional) GET pra testar no navegador
 app.get("/whatsapp", (req, res) => {
   res
     .status(200)
-    .send("OK (GET) - use POST para mensagens do Kommo");
+    .send("OK (GET) - endpoint ativo. Use POST para Kommo.");
 });
 
-// ===== WEBHOOK KOMMO =====
+// ================== WEBHOOK KOMMO ==================
 app.post("/whatsapp", async (req, res) => {
-  // -------- DEBUG --------
   console.log("========== WEBHOOK KOMMO RECEBIDO ==========");
-  console.log("HEADERS:", JSON.stringify(req.headers, null, 2));
   console.log("BODY:", JSON.stringify(req.body, null, 2));
 
   // -------- LEITURA DEFENSIVA --------
@@ -43,7 +40,7 @@ app.post("/whatsapp", async (req, res) => {
   console.log("FROM:", from);
   console.log("TEXTO:", texto);
 
-  // -------- SE NÃO FOR TEXTO, IGNORA --------
+  // -------- IGNORA EVENTOS SEM TEXTO --------
   if (!texto) {
     return res.status(200).json({
       ok: true,
@@ -52,16 +49,17 @@ app.post("/whatsapp", async (req, res) => {
     });
   }
 
-  // -------- RESPOSTA SIMPLES (TESTE) --------
-  // Quando isso responder no WhatsApp, a integração está 100% OK
+  // -------- RESPOSTA DE TESTE --------
   return res.status(200).json({
     type: "text",
     text: "Recebi sua mensagem ✅",
   });
 });
 
-// Porta (Render)
+// ================== START SERVER ==================
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
   console.log(Agente rodando na porta ${PORT});
 });
+

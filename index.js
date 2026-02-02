@@ -50,7 +50,13 @@ app.get("/oauth2/callback", async (req, res) => {
 // Webhook do WhatsApp (Twilio)
 app.post("/whatsapp", async (req, res) => {
   const texto = (req.body.Body || "").trim();
+// ===== DEBUG (Kommo) =====
+  console.log("WEBHOOK KOMMO RECEBIDO");
+  console.log("HEADERS:", JSON.stringify(req.headers, null, 2));
+  console.log("BODY:", JSON.stringify(req.body, null, 2));
 
+  // Responder rápido (evita timeout do Kommo)
+  res.set("Content-Type", "application/json");
   // Se ainda não conectou o Google, manda o link certo
   if (!tokens) {
     const baseUrl = process.env.PUBLIC_BASE_URL || "https://SEU-SERVICO.onrender.com";
@@ -108,3 +114,4 @@ app.post("/whatsapp", async (req, res) => {
 });
 
 app.listen(process.env.PORT || 3000, () => console.log("Agente rodando"));
+

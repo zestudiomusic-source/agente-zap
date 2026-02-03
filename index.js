@@ -1,16 +1,15 @@
 const express = require("express");
-const fetch = require("node-fetch");
 
 const app = express();
 
 /* ===============================
-   MIDDLEWARES (OBRIGATÓRIOS)
+   MIDDLEWARES (OBRIGATÓRIO)
 ================================ */
-app.use(express.json()); // <<< SEM ISSO O BODY VEM {}
+app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 /* ===============================
-   WEBHOOK DO KOMMO
+   WEBHOOK KOMMO
 ================================ */
 app.post("/kommo/webhook", async (req, res) => {
   try {
@@ -18,18 +17,18 @@ app.post("/kommo/webhook", async (req, res) => {
     console.log(JSON.stringify(req.body, null, 2));
     console.log("================================");
 
-    const message =
-      req.body?.message?.text ||
-      req.body?.message?.body ||
-      "Mensagem não identificada";
+    // ✅ CAMPOS CORRETOS DO KOMMO
+    const message = req.body.text || "Mensagem não identificada";
+    const leadId = req.body.entity_id || null;
+    const contactId = req.body.contact_id || null;
+    const author = req.body.author?.name || "Desconhecido";
 
-    const chatId = req.body?.chat?.id;
-    const leadId = req.body?.lead?.id;
-
-    // Aqui depois entra o ChatGPT
     console.log("Mensagem:", message);
-    console.log("Chat ID:", chatId);
     console.log("Lead ID:", leadId);
+    console.log("Contact ID:", contactId);
+    console.log("Autor:", author);
+
+    // Aqui depois entra ChatGPT + resposta no WhatsApp
 
     return res.sendStatus(200);
   } catch (error) {
@@ -39,17 +38,12 @@ app.post("/kommo/webhook", async (req, res) => {
 });
 
 /* ===============================
-   ROTA DE TESTE (OPCIONAL)
+   ROTA DE TESTE
 ================================ */
 app.get("/", (req, res) => {
-  res.send("Servidor Kommo + ChatGPT rodando 🚀");
+  res.send("Servidor Kommo rodando corretamente 🚀");
 });
 
 /* ===============================
-   START DO SERVIDOR
-================================ */
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log("Servidor rodando na porta", PORT);
-});
+
 

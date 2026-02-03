@@ -1,19 +1,22 @@
 import express from "express";
+import fetch from "node-fetch";
 
 const app = express();
+app.use(express.json());
 
-// Precisa pegar JSON e também texto cru (alguns webhooks mandam diferente)
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
+// Porta (Render usa process.env.PORT)
+const PORT = process.env.PORT || 10000;
 
-const PORT = process.env.PORT || 3000;
-
-// Rota raiz (pra ver no navegador)
+// ==============================
+// ROTA RAIZ
+// ==============================
 app.get("/", (req, res) => {
   res.send("Agente online");
 });
 
-// Health check
+// ==============================
+// HEALTH CHECK
+// ==============================
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -22,68 +25,118 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ---------------------------
+// ==============================
 // WEBHOOK KOMMO
-// ---------------------------
+// ==============================
 app.post("/kommo/webhook", async (req, res) => {
+  console.log("================================");
+  console.log("Webhook do Kommo recebido");
+
+  const body = req.body;
+  console.log("BODY:", body);
+
   try {
-    console.log("====================================");
-    console.log("Webhook do Kommo recebido");
-    console.log("BODY (raw object):");
-    console.log(req.body);
-
-    // Tentativa de extrair texto, telefone e nome
-    // (o Kommo pode mudar o formato dependendo do evento)
-    let texto = "";
-    let telefone = "";
-    let nome = "";
-
-    // Caso comum que você mostrou: body.message.add[0]
-    if (req.body && req.body.message && req.body.message.add && req.body.message.add.length > 0) {
-      const item = req.body.message.add[0];
-
-      // Texto
-      if (item && item.message && typeof item.message.text === "string") {
-        texto = item.message.text;
-      }
-
-      // Nome
-      if (item && item.contact && item.contact.name) {
-        nome = item.contact.name;
-      }
-
-      // Telefone (às vezes vem como id, às vezes phone)
-      if (item && item.contact && item.contact.id) {
-        telefone = String(item.contact.id);
-      }
-      if (item && item.contact && item.contact.phone) {
-        telefone = String(item.contact.phone);
-      }
-    }
-
-    // Logs bonitos
-    if (!texto) {
+    // Verifica se existe mensagem
+    if (
+      !body ||
+      !body.message ||
+      !body.message.add ||
+      !body.message.add[0] ||
+      !body.message.add[0].text
+    ) {
       console.log("Nenhuma mensagem encontrada");
-    } else {
-      console.log("Texto: " + texto);
-      console.log("Telefone: " + (telefone || "nao encontrado"));
-      console.log("Nome: " + (nome || "Contato sem nome"));
+      console.log("================================");
+      return res.status(200).json({ ok: true });
     }
 
-    console.log("====================================");
+    const mensagem = body.message.add[0].text;
+    const telefone = body.message.add[0].contact_id || "desconhecido";
+    const nome =
+      body.message.add[0].contact_name || "Contato sem nome";
 
-    // Resposta OK pro Kommo
+    console.log("Texto:", mensagem);
+    console.log("Telefone:", telefone);
+    console.log("Nome:", nome);
+
+    // ==============================
+    // CHAMADA PARA OPENAI
+    // ==============================
+    const openaiResponse = await fetch(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization":
+            "Bearer " + process.env.OPENAI_API_KEY
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role: "system",
+              content:
+                "Você é um assistente educado e profissional."
+            },
+            {
+              role: "user",
+              content: mensagem
+            }
+          ]
+        })
+      }
+    );
+
+    const openaiData = await openaiResponse.json();
+    const respostaIA =
+      openaiData.choices &&
+      openaiData.choices[0] &&
+      openaiData.choices[0].message &&
+      openaiData.choices[0].message.content
+        ? openaiData.choices[0].message.content
+        : "Não consegui responder agora.";
+
+    console.log("Resposta IA:", respostaIA);
+
+    // ==============================
+    // ENVIO DA RESPOSTA PARA KOMMO
+    // ==============================
+    const kommoUrl =
+      "https://" +
+      process.env.KOMMO_SUBDOMAIN +
+      ".kommo.com/api/v4/messages";
+
+    await fetch(kommoUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization":
+          "Bearer " + process.env.KOMMO_TOKEN
+      },
+      body: JSON.stringify({
+        message: {
+          type: "text",
+          text: respostaIA
+        },
+        contact_id: telefone
+      })
+    });
+
+    console.log("Mensagem enviada ao Kommo");
+    console.log("================================");
+
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.log("Erro no webhook:");
-    console.log(err);
-    return res.status(500).json({ ok: false });
+    console.error("Erro no webhook:", err);
+    console.log("================================");
+    return res.status(500).json({ error: "Erro interno" });
   }
 });
 
-// ---------------------------
-// START
-// ---------------------------
+// ==============================
+// START SERVER
+// ==============================
 app.listen(PORT, () => {
   console.log("Agente rodando na porta " + PORT);
 });
+

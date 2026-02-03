@@ -1,48 +1,63 @@
+// index.js - Endpoint para Salesbot do Kommo chamar o ChatGPT
+// CommonJS (require). NAO usar "type": "module"
+
 const express = require("express");
+const fetch = require("node-fetch");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
 
-/* Health check */
+// Health check
 app.get("/health", function (req, res) {
-  res.json({ status: "ok" });
+  res.status(200).send("OK");
 });
 
-/* Webhook Kommo */
-app.post("/kommo/webhook", function (req, res) {
-  console.log("==============================");
-  console.log("Webhook do Kommo recebido");
+// Endpoint chamado pelo Salesbot
+app.post("/chatgpt", async function (req, res) {
+  try {
+    const texto = req.body && req.body.text ? req.body.text : "";
+    const telefone = req.body && req.body.phone ? req.body.phone : "";
 
-  const body = req.body || {};
+    if (!texto) {
+      return res.json({ reply: "Nao entendi sua mensagem." });
+    }
 
-  if (!body.message || !body.message.add || body.message.add.length === 0) {
-    console.log("Nenhuma mensagem encontrada");
-    console.log("BODY:", body);
-    console.log("==============================");
-    return res.status(200).json({ ok: true });
+    const response = await fetch(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": "Bearer " + process.env.OPENAI_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "gpt-4o-mini",
+          messages: [
+            { role: "system", content: "Voce e um atendente educado e objetivo." },
+            { role: "user", content: texto }
+          ]
+        })
+      }
+    );
+
+    const data = await response.json();
+    const resposta =
+      data &&
+      data.choices &&
+      data.choices[0] &&
+      data.choices[0].message &&
+      data.choices[0].message.content
+        ? data.choices[0].message.content
+        : "Nao consegui responder agora.";
+
+    return res.json({ reply: resposta });
+  } catch (err) {
+    return res.json({ reply: "Erro ao responder." });
   }
-
-  const msg = body.message.add[0];
-
-  const texto = msg.text || "";
-  const telefone = msg.contact_id || "nao identificado";
-  let nome = "Contato sem nome";
-
-  if (msg.contact && msg.contact.name) {
-    nome = msg.contact.name;
-  }
-
-  console.log("Texto:", texto);
-  console.log("Telefone:", telefone);
-  console.log("Nome:", nome);
-  console.log("==============================");
-
-  return res.status(200).json({ ok: true });
 });
 
-/* Start server */
-app.listen(PORT, "0.0.0.0", function () {
-  console.log("Agente rodando na porta " + PORT);
+app.listen(PORT, function () {
+  console.log("Servidor rodando na porta " + PORT);
 });

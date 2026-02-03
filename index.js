@@ -4,71 +4,59 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// Porta (Render usa process.env.PORT)
 const PORT = process.env.PORT || 10000;
 
-// ==============================
-// ROTA RAIZ
-// ==============================
-app.get("/", (req, res) => {
-  res.send("Agente online");
-});
+const KOMMO_SUBDOMAIN = process.env.KOMMO_SUBDOMAIN;
+const KOMMO_TOKEN = process.env.KOMMO_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// ==============================
-// HEALTH CHECK
-// ==============================
+/* ===================== HEALTH ===================== */
 app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    message: "Agente rodando",
-    time: new Date().toISOString()
-  });
+  return res.json({ status: "ok", message: "Agente rodando" });
 });
 
-// ==============================
-// WEBHOOK KOMMO
-// ==============================
-app.post("/kommo/webhook", async (req, res) => {
+/* ===================== WEBHOOK ===================== */
+app.post("/webhook", async (req, res) => {
   console.log("================================");
   console.log("Webhook do Kommo recebido");
 
-  const body = req.body;
-  console.log("BODY:", body);
-
   try {
-    // Verifica se existe mensagem
+    const body = req.body;
+
     if (
       !body ||
       !body.message ||
       !body.message.add ||
-      !body.message.add[0] ||
-      !body.message.add[0].text
+      body.message.add.length === 0
     ) {
       console.log("Nenhuma mensagem encontrada");
       console.log("================================");
       return res.status(200).json({ ok: true });
     }
 
-    const mensagem = body.message.add[0].text;
-    const telefone = body.message.add[0].contact_id || "desconhecido";
-    const nome =
-      body.message.add[0].contact_name || "Contato sem nome";
+    const msg = body.message.add[0];
 
-    console.log("Texto:", mensagem);
+    const textoRecebido =
+      msg.text || msg.message || "Mensagem sem texto";
+
+    const telefone =
+      msg.contact?.id || "telefone_desconhecido";
+
+    const nome =
+      msg.contact?.name || "Contato sem nome";
+
+    console.log("Texto:", textoRecebido);
     console.log("Telefone:", telefone);
     console.log("Nome:", nome);
 
-    // ==============================
-    // CHAMADA PARA OPENAI
-    // ==============================
+    /* ===================== OPENAI ===================== */
     const openaiResponse = await fetch(
       "https://api.openai.com/v1/chat/completions",
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Authorization":
-            "Bearer " + process.env.OPENAI_API_KEY
+          "Authorization": "Bearer " + OPENAI_API_KEY
         },
         body: JSON.stringify({
           model: "gpt-4o-mini",
@@ -76,66 +64,61 @@ app.post("/kommo/webhook", async (req, res) => {
             {
               role: "system",
               content:
-                "Você é um assistente educado e profissional."
+                "Você é um atendente educado, claro e direto. Responda mensagens de WhatsApp de forma curta e amigável."
             },
             {
               role: "user",
-              content: mensagem
+              content: textoRecebido
             }
-          ]
+          ],
+          temperature: 0.5
         })
       }
     );
 
     const openaiData = await openaiResponse.json();
+
     const respostaIA =
       openaiData.choices &&
       openaiData.choices[0] &&
       openaiData.choices[0].message &&
       openaiData.choices[0].message.content
         ? openaiData.choices[0].message.content
-        : "Não consegui responder agora.";
+        : "Desculpa, não consegui responder agora.";
 
     console.log("Resposta IA:", respostaIA);
 
-    // ==============================
-    // ENVIO DA RESPOSTA PARA KOMMO
-    // ==============================
+    /* ===================== ENVIAR PARA KOMMO ===================== */
     const kommoUrl =
       "https://" +
-      process.env.KOMMO_SUBDOMAIN +
+      KOMMO_SUBDOMAIN +
       ".kommo.com/api/v4/messages";
 
     await fetch(kommoUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization":
-          "Bearer " + process.env.KOMMO_TOKEN
+        "Authorization": "Bearer " + KOMMO_TOKEN
       },
       body: JSON.stringify({
-        message: {
-          type: "text",
-          text: respostaIA
-        },
+        message_type: "text",
+        text: respostaIA,
         contact_id: telefone
       })
     });
 
-    console.log("Mensagem enviada ao Kommo");
+    console.log("Resposta enviada ao WhatsApp");
     console.log("================================");
 
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("Erro no webhook:", err);
+    console.log("Erro no webhook:", err.message);
     console.log("================================");
-    return res.status(500).json({ error: "Erro interno" });
+    return res.status(200).json({ ok: true });
   }
 });
 
-// ==============================
-// START SERVER
-// ==============================
+/* ===================== START ===================== */
 app.listen(PORT, () => {
   console.log("Agente rodando na porta " + PORT);
 });

@@ -15,14 +15,17 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     message: "Agente rodando",
-    time: new Date().toISOString()
+    time: new Date().toISOString(),
   });
 });
 
-/* Placeholder WhatsApp */
-app.post("/whatsapp", (req, res) => {
-  console.log("Mensagem recebida:", req.body);
-  res.send("Webhook recebido");
+/* Webhook do Kommo (vai configurar no Kommo para chamar esta URL) */
+app.post("/kommo/webhook", (req, res) => {
+  console.log("Kommo webhook recebido:");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  // Por enquanto só confirma recebimento
+  return res.status(200).json({ ok: true });
 });
 
 app.listen(PORT, () => {

@@ -19,7 +19,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-/* Placeholder WhatsApp (vamos usar já já) */
+/* Placeholder WhatsApp */
 app.post("/whatsapp", (req, res) => {
   console.log("Mensagem recebida:", req.body);
   res.send("Webhook recebido");

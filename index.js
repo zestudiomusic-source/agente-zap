@@ -3,11 +3,13 @@ import express from "express";
 const app = express();
 
 /**
- * Captura RAW BODY (obrigatório para Kommo)
+ * MUITO IMPORTANTE
+ * Kommo envia webhook como FORM, não JSON
  */
-app.use(express.raw({ type: "/" }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 
 /**
  * Rota raiz
@@ -34,20 +36,11 @@ app.post("/kommo/webhook", (req, res) => {
   console.log("================================");
   console.log("Webhook do Kommo recebido");
 
-  // Corpo bruto
-  const rawBody = req.body?.toString("utf8") || "";
+  // Kommo manda como FORM DATA
+  console.log("BODY:", req.body);
 
-  console.log("RAW BODY:");
-  console.log(rawBody);
-
-  // Tenta converter em JSON (se der)
-  try {
-    const parsed = JSON.parse(rawBody);
-    console.log("JSON PARSEADO:");
-    console.log(JSON.stringify(parsed, null, 2));
-  } catch (err) {
-    console.log("Não foi possível converter para JSON");
-  }
+  // Se quiser ver tudo cru:
+  console.log("Keys:", Object.keys(req.body));
 
   console.log("================================");
 

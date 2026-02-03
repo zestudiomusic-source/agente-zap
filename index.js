@@ -61,3 +61,10 @@ app.post("/chatgpt", async function (req, res) {
 app.listen(PORT, function () {
   console.log("Servidor rodando na porta " + PORT);
 });
+app.post("/kommo/webhook", (req, res) => {
+  console.log("========== WEBHOOK KOMMO ==========");
+  console.log(JSON.stringify(req.body, null, 2));
+  console.log("===================================");
+  res.status(200).json({ ok: true });
+});
+

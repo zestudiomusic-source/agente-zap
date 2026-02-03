@@ -2,10 +2,6 @@ import express from "express";
 
 const app = express();
 
-/**
- * MUITO IMPORTANTE
- * Kommo envia webhook como FORM, não JSON
- */
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -19,7 +15,7 @@ app.get("/", (req, res) => {
 });
 
 /**
- * Health check
+ * Health
  */
 app.get("/health", (req, res) => {
   res.json({
@@ -30,17 +26,44 @@ app.get("/health", (req, res) => {
 });
 
 /**
- * Webhook do Kommo
+ * Webhook Kommo
  */
 app.post("/kommo/webhook", (req, res) => {
   console.log("================================");
   console.log("Webhook do Kommo recebido");
 
-  // Kommo manda como FORM DATA
-  console.log("BODY:", req.body);
+  const payload = req.body;
 
-  // Se quiser ver tudo cru:
-  console.log("Keys:", Object.keys(req.body));
+  try {
+    const msg = payload?.message?.add?.[0];
+
+    if (!msg) {
+      console.log("Nenhuma mensagem encontrada");
+      return res.status(200).json({ ok: true });
+    }
+
+    const texto =
+      msg.text ||
+      msg.message ||
+      msg.content ||
+      "[mensagem sem texto]";
+
+    const telefone =
+      msg.sender?.phone ||
+      msg.chat_id ||
+      "telefone nao identificado";
+
+    const nome =
+      msg.sender?.name ||
+      "Contato sem nome";
+
+    console.log("📩 Texto:", texto);
+    console.log("📱 Telefone:", telefone);
+    console.log("👤 Nome:", nome);
+
+  } catch (err) {
+    console.log("Erro ao processar mensagem:", err.message);
+  }
 
   console.log("================================");
 
@@ -53,3 +76,4 @@ app.post("/kommo/webhook", (req, res) => {
 app.listen(PORT, () => {
   console.log("Agente rodando na porta " + PORT);
 });
+

@@ -58,5 +58,4 @@ app.post("/kommo/webhook", (req, res) => {
  * Start
  */
 app.listen(PORT, () => {
-  console.log(Agente rodando na porta ${PORT});
-});
+  console.log("Agente rodando na porta " + PORT);

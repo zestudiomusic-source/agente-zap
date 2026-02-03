@@ -5,12 +5,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-/* Rota raiz */
 app.get("/", (req, res) => {
   res.send("Agente online 🚀");
 });
 
-/* Health check */
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -19,12 +17,10 @@ app.get("/health", (req, res) => {
   });
 });
 
-/* Webhook do Kommo */
 app.post("/kommo/webhook", (req, res) => {
   console.log("Webhook do Kommo recebido:");
   console.log(JSON.stringify(req.body, null, 2));
-
-  return res.status(200).json({ ok: true });
+  res.status(200).json({ ok: true });
 });
 
 app.listen(PORT, () => {

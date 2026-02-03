@@ -1,83 +1,89 @@
 import express from "express";
-import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json());
 
-const PORT = process.env.PORT || 10000;
-const KOMMO_TOKEN = process.env.KOMMO_TOKEN;
-const KOMMO_SUBDOMAIN = process.env.KOMMO_SUBDOMAIN;
+// Precisa pegar JSON e também texto cru (alguns webhooks mandam diferente)
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
 
-/**
- * Health check
- */
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+const PORT = process.env.PORT || 3000;
+
+// Rota raiz (pra ver no navegador)
+app.get("/", (req, res) => {
+  res.send("Agente online");
 });
 
-/**
- * Webhook Kommo
- */
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Agente rodando",
+    time: new Date().toISOString()
+  });
+});
+
+// ---------------------------
+// WEBHOOK KOMMO
+// ---------------------------
 app.post("/kommo/webhook", async (req, res) => {
-  console.log("====================================");
-  console.log("Webhook do Kommo recebido");
-
   try {
-    const body = req.body;
+    console.log("====================================");
+    console.log("Webhook do Kommo recebido");
+    console.log("BODY (raw object):");
+    console.log(req.body);
 
-    if (
-      !body.message ||
-      !body.message.add ||
-      !body.message.add[0] ||
-      !body.message.add[0].text
-    ) {
-      console.log("Nenhuma mensagem encontrada");
-      console.log("====================================");
-      return res.status(200).json({ ok: true });
+    // Tentativa de extrair texto, telefone e nome
+    // (o Kommo pode mudar o formato dependendo do evento)
+    let texto = "";
+    let telefone = "";
+    let nome = "";
+
+    // Caso comum que você mostrou: body.message.add[0]
+    if (req.body && req.body.message && req.body.message.add && req.body.message.add.length > 0) {
+      const item = req.body.message.add[0];
+
+      // Texto
+      if (item && item.message && typeof item.message.text === "string") {
+        texto = item.message.text;
+      }
+
+      // Nome
+      if (item && item.contact && item.contact.name) {
+        nome = item.contact.name;
+      }
+
+      // Telefone (às vezes vem como id, às vezes phone)
+      if (item && item.contact && item.contact.id) {
+        telefone = String(item.contact.id);
+      }
+      if (item && item.contact && item.contact.phone) {
+        telefone = String(item.contact.phone);
+      }
     }
 
-    const textoRecebido = body.message.add[0].text;
-    const contatoId = body.message.add[0].contact_id;
+    // Logs bonitos
+    if (!texto) {
+      console.log("Nenhuma mensagem encontrada");
+    } else {
+      console.log("Texto: " + texto);
+      console.log("Telefone: " + (telefone || "nao encontrado"));
+      console.log("Nome: " + (nome || "Contato sem nome"));
+    }
 
-    console.log("Texto:", textoRecebido);
-    console.log("Contato ID:", contatoId);
+    console.log("====================================");
 
-    const resposta = "Oi! Recebi sua mensagem. Como posso ajudar?";
-
-    const url = https://${KOMMO_SUBDOMAIN}.kommo.com/api/v4/messages;
-
-    const payload = {
-      messages: [
-        {
-          contact_id: contatoId,
-          text: resposta
-        }
-      ]
-    };
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Authorization": Bearer ${KOMMO_TOKEN},
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const result = await response.text();
-    console.log("Resposta Kommo:", result);
+    // Resposta OK pro Kommo
+    return res.status(200).json({ ok: true });
   } catch (err) {
-    console.log("Erro:", err.message);
+    console.log("Erro no webhook:");
+    console.log(err);
+    return res.status(500).json({ ok: false });
   }
-
-  console.log("====================================");
-  res.status(200).json({ ok: true });
 });
 
-/**
- * Start server
- */
+// ---------------------------
+// START
+// ---------------------------
 app.listen(PORT, () => {
   console.log("Agente rodando na porta " + PORT);
 });
-

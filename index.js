@@ -1,16 +1,24 @@
 import express from "express";
 
 const app = express();
-app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+/**
+ * Captura RAW BODY (obrigatório para Kommo)
+ */
+app.use(express.raw({ type: "/" }));
 
-/* Rota raiz */
+const PORT = process.env.PORT || 10000;
+
+/**
+ * Rota raiz
+ */
 app.get("/", (req, res) => {
-  res.send("Agente online");
+  res.send("Agente online 🚀");
 });
 
-/* Health check */
+/**
+ * Health check
+ */
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -19,15 +27,36 @@ app.get("/health", (req, res) => {
   });
 });
 
-/* Webhook do Kommo */
+/**
+ * Webhook do Kommo
+ */
 app.post("/kommo/webhook", (req, res) => {
-  console.log("Webhook do Kommo recebido:");
-  console.log(JSON.stringify(req.body, null, 2));
+  console.log("================================");
+  console.log("Webhook do Kommo recebido");
+
+  // Corpo bruto
+  const rawBody = req.body?.toString("utf8") || "";
+
+  console.log("RAW BODY:");
+  console.log(rawBody);
+
+  // Tenta converter em JSON (se der)
+  try {
+    const parsed = JSON.parse(rawBody);
+    console.log("JSON PARSEADO:");
+    console.log(JSON.stringify(parsed, null, 2));
+  } catch (err) {
+    console.log("Não foi possível converter para JSON");
+  }
+
+  console.log("================================");
 
   return res.status(200).json({ ok: true });
 });
 
-/* Start do servidor */
+/**
+ * Start
+ */
 app.listen(PORT, () => {
-  console.log("Agente rodando na porta " + PORT);
+  console.log(Agente rodando na porta ${PORT});
 });

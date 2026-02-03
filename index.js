@@ -40,4 +40,5 @@ app.post("/kommo/webhook", async (req, res) => {
     console.log("Lead ID:", leadId);
     console.log("Contact ID:", contactId);
     console.log("Chat ID:", chatId);
-    console.log("Talk ID:", talk
+    console.log("Talk ID:", talkId);
+

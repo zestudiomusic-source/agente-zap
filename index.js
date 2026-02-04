@@ -1,35 +1,25 @@
 import express from "express";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-/**
- * ================================
- * VARIÁVEIS DE AMBIENTE (RENDER)
- * ================================
- * WA_VERIFY_TOKEN   -> mesmo valor configurado no Meta Webhook
- * WA_TOKEN          -> token permanente do WhatsApp Cloud
- * PHONE_NUMBER_ID   -> Phone Number ID do WhatsApp Cloud
- */
+/* =========================
+   ENV VARS (Render)
+========================= */
 const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "zap123";
-const WA_TOKEN = process.env.WA_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const WA_TOKEN = process.env.WA_TOKEN; // obrigatório
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID; // obrigatório
 
-/**
- * ================================
- * ROTA RAIZ (TESTE)
- * ================================
- */
+/* =========================
+   ROTA RAIZ (TESTE)
+========================= */
 app.get("/", (req, res) => {
   res.send("Servidor rodando corretamente 🚀");
 });
 
-/**
- * ================================
- * VERIFICAÇÃO DO WEBHOOK (GET)
- * ================================
- */
+/* =========================
+   VERIFICAÇÃO WHATSAPP (GET)
+========================= */
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -38,30 +28,28 @@ app.get("/webhook", (req, res) => {
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
     console.log("✅ Webhook verificado com sucesso");
     return res.status(200).send(challenge);
+  } else {
+    console.log("❌ Falha na verificação", { mode, token });
+    return res.sendStatus(403);
   }
-
-  console.log("❌ Falha na verificação do webhook");
-  return res.sendStatus(403);
 });
 
-/**
- * ================================
- * RECEBER MENSAGENS (POST)
- * ================================
- */
+/* =========================
+   RECEBER EVENTOS (POST)
+========================= */
 app.post("/webhook", async (req, res) => {
-  try {
-    // Responde rápido pro WhatsApp não reenviar
-    res.sendStatus(200);
+  // responde rápido pra Meta não reenviar
+  res.sendStatus(200);
 
+  try {
     const body = req.body;
     console.log("📩 EVENTO RECEBIDO:", JSON.stringify(body, null, 2));
 
     const entry = body.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
-    const message = value?.messages?.[0];
 
+    const message = value?.messages?.[0];
     if (!message) return;
 
     const from = message.from; // número do cliente
@@ -100,15 +88,13 @@ app.post("/webhook", async (req, res) => {
     console.log("✅ RESPOSTA ENVIADA:", data);
 
   } catch (err) {
-    console.error("🔥 ERRO NO /webhook:", err);
+    console.error("🔥 ERRO NO WEBHOOK:", err);
   }
 });
 
-/**
- * ================================
- * START DO SERVIDOR
- * ================================
- */
+/* =========================
+   START SERVER
+========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(✅ Servidor rodando na porta ${PORT});

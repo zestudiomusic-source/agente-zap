@@ -3,64 +3,88 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-const VERIFY_TOKEN = "zap123";
+// ENV VARS (Render)
+const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "zap123";
+const WA_TOKEN = process.env.WA_TOKEN; // obrigatório
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID; // obrigatório
 
-// rota raiz (já existe)
+// ✅ rota raiz (teste)
 app.get("/", (req, res) => {
-  res.send("Servidor Kommo rodando corretamente 🚀");
+  res.send("Servidor rodando corretamente 🚀");
 });
 
-// 🔹 VERIFICAÇÃO DO WHATSAPP (GET)
+// ✅ VERIFICAÇÃO DO WHATSAPP (GET)
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("Webhook verificado com sucesso");
-    res.status(200).send(challenge);
+    console.log("✅ Webhook verificado com sucesso");
+    return res.status(200).send(challenge);
   } else {
-    res.sendStatus(403);
+    console.log("❌ Falha na verificação do webhook", { mode, token });
+    return res.sendStatus(403);
   }
 });
 
-// 🔹 RECEBER MENSAGENS (POST)
+// ✅ RECEBER EVENTOS (POST)
 app.post("/webhook", async (req, res) => {
-  console.log("📩 EVENTO RECEBIDO:");
-  console.log(JSON.stringify(req.body, null, 2));
+  try {
+    // sempre responde 200 rápido pro WhatsApp não reenviar
+    res.sendStatus(200);
 
-  const entry = req.body.entry?.[0];
-  const changes = entry?.changes?.[0];
-  const message = changes?.value?.messages?.[0];
+    const body = req.body;
+    console.log("📩 EVENTO RECEBIDO:", JSON.stringify(body, null, 2));
 
-  if (message && message.from) {
-    const from = message.from;
+    const entry = body.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
 
-    await fetch(
-      "https://graph.facebook.com/v18.0/SEU_PHONE_NUMBER_ID/messages",
-      {
+    // mensagens recebidas
+    const message = value?.messages?.[0];
+    if (!message) return;
+
+    const from = message.from; // número do cliente
+    const msgType = message.type;
+
+    // se for texto, responde
+    if (msgType === "text") {
+      const text = message.text?.body || "";
+
+      if (!WA_TOKEN || !PHONE_NUMBER_ID) {
+        console.log("❌ Falta WA_TOKEN ou PHONE_NUMBER_ID no Render (env vars).");
+        return;
+      }
+
+      const replyText = Recebi: ${text};
+
+      const url = https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages;
+
+      const payload = {
+        messaging_product: "whatsapp",
+        to: from,
+        type: "text",
+        text: { body: replyText },
+      };
+
+      const response = await fetch(url, {
         method: "POST",
         headers: {
-          "Authorization": Bearer ${process.env.WA_TOKEN},
-          "Content-Type": "application/json"
+          "Authorization": Bearer ${WA_TOKEN},
+          "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          to: from,
-          text: { body: "Olá! Recebi sua mensagem 😊" }
-        })
-      }
-    );
-  }
+        body: JSON.stringify(payload),
+      });
 
-  res.sendStatus(200);
-});
-  res.sendStatus(200);
+      const data = await response.json();
+      console.log("✅ RESPOSTA ENVIADA:", data);
+    }
+
+  } catch (err) {
+    console.log("🔥 ERRO NO /webhook:", err);
+  }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Servidor rodando na porta", PORT);
-});
-
-
+app.listen(PORT, () => console.log(✅ Servidor rodando na porta ${PORT}));

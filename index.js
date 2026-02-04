@@ -1,22 +1,24 @@
 const express = require("express");
-const app = express;
+const fetch = require("node-fetch");
 
-// =====================
-// MIDDLEWARES
-// =====================
+const app = express();
+
+/* =======================
+   MIDDLEWARES
+======================= */
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// =====================
-// ROTA DE TESTE
-// =====================
+/* =======================
+   ROTA DE TESTE
+======================= */
 app.get("/", (req, res) => {
-  res.status(200).send("Servidor Kommo rodando corretamente 🚀");
+  res.status(200).send("Servidor Kommo rodando corretamente");
 });
 
-// =====================
-// OPENAI (Responses API)
-// =====================
+/* =======================
+   CHATGPT (Responses API)
+======================= */
 async function gerarRespostaChatGPT(userText) {
   const apiKey = process.env.OPENAI_API_KEY;
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
@@ -45,14 +47,15 @@ async function gerarRespostaChatGPT(userText) {
   });
 
   if (!resp.ok) {
-    const errTxt = await resp.text();
-    return `Erro OpenAI (${resp.status}): ${errTxt}`;
+    const err = await resp.text();
+    return `Erro OpenAI (${resp.status}): ${err}`;
   }
 
   const data = await resp.json();
 
   if (data.output_text) return data.output_text;
 
+  // fallback seguro
   try {
     const chunks = [];
     for (const item of data.output || []) {
@@ -62,55 +65,46 @@ async function gerarRespostaChatGPT(userText) {
     }
     return chunks.join("\n").trim() || "Não consegui gerar resposta agora.";
   } catch {
-    return "Não consegui interpretar a resposta do modelo.";
+    return "Erro ao interpretar resposta do ChatGPT.";
   }
 }
 
-// =====================
-// WEBHOOK KOMMO
-// =====================
+/* =======================
+   WEBHOOK KOMMO
+======================= */
 app.post("/kommo/webhook", async (req, res) => {
   try {
-    console.log("========== WEBHOOK KOMMO ==========");
+    console.log("====== WEBHOOK KOMMO ======");
     console.log(JSON.stringify(req.body, null, 2));
-    console.log("==================================");
 
     const event = req.body?.message?.add?.[0];
-    if (!event || !event.text) return res.sendStatus(200);
+
+    if (!event || !event.text) {
+      return res.sendStatus(200);
+    }
 
     const message = event.text;
-    const leadId = event.entity_id ?? null;
-    const contactId = event.contact_id ?? null;
-    const chatId = event.chat_id ?? null;
-    const talkId = event.talk_id ?? null;
-    const author = event.author?.name || "Desconhecido";
-    const origin = event.origin ?? null;
 
     console.log("Mensagem:", message);
-    console.log("Lead ID:", leadId);
-    console.log("Contact ID:", contactId);
-    console.log("Chat ID:", chatId);
-    console.log("Talk ID:", talkId);
-    console.log("Autor:", author);
-    console.log("Origin:", origin);
 
     const resposta = await gerarRespostaChatGPT(message);
+
     console.log("Resposta ChatGPT:", resposta);
 
-    // Aqui entra o envio real para o Kommo (WhatsApp)
-    // depende do token / endpoint da sua conta
+    // Aqui entra o envio da resposta via API do Kommo (próximo passo)
 
     return res.sendStatus(200);
-  } catch (error) {
-    console.error("ERRO NO WEBHOOK:", error);
+  } catch (err) {
+    console.error("Erro no webhook:", err);
     return res.sendStatus(500);
   }
 });
 
-// =====================
-// START SERVER
-// =====================
+/* =======================
+   START SERVER
+======================= */
 const PORT = process.env.PORT || 10000;
+
 app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
 });

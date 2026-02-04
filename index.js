@@ -25,9 +25,36 @@ app.get("/webhook", (req, res) => {
 });
 
 // 🔹 RECEBER MENSAGENS (POST)
-app.post("/webhook", (req, res) => {
-  console.log("📩 EVENTO RECEBIDO:", JSON.stringify(req.body, null, 2));
+app.post("/webhook", async (req, res) => {
+  console.log("📩 EVENTO RECEBIDO:");
+  console.log(JSON.stringify(req.body, null, 2));
 
+  const entry = req.body.entry?.[0];
+  const changes = entry?.changes?.[0];
+  const message = changes?.value?.messages?.[0];
+
+  if (message && message.from) {
+    const from = message.from;
+
+    await fetch(
+      "https://graph.facebook.com/v18.0/SEU_PHONE_NUMBER_ID/messages",
+      {
+        method: "POST",
+        headers: {
+          "Authorization": Bearer ${process.env.WA_TOKEN},
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to: from,
+          text: { body: "Olá! Recebi sua mensagem 😊" }
+        })
+      }
+    );
+  }
+
+  res.sendStatus(200);
+});
   res.sendStatus(200);
 });
 
@@ -35,4 +62,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
 });
+
 

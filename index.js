@@ -3,7 +3,7 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN;
+const VERIFY_TOKEN = "zap123";
 
 // rota raiz (já existe)
 app.get("/", (req, res) => {
@@ -35,3 +35,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
 });
+

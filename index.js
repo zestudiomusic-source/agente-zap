@@ -1,23 +1,3 @@
-INDEX.JS (com DB + Telegram Webhook) — cole por cima do seu index.js
-========================================================
-
-1) Antes de rodar:
-   - Crie um arquivo .env na raiz do projeto com:
-     BOT_TOKEN=COLE_AQUI_SEU_TOKEN_DO_BOTFATHER
-     (opcional) PORT=3000
-
-2) Instale dependências (se ainda não tiver):
-   npm i express better-sqlite3 dotenv
-
-3) Suba no Render e defina a variável de ambiente BOT_TOKEN
-   (Environment Variables)
-
-4) Depois do deploy, defina o webhook (uma vez):
-   https://api.telegram.org/bot<SEU_TOKEN>/setWebhook?url=https://SEU_DOMINIO_NO_RENDER/telegram/webhook
-
-========================================================
-Código:
---------------------------------------------------------
 require('dotenv').config();
 
 const express = require('express');
@@ -167,4 +147,5 @@ app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
   console.log('DB em:', dbPath);
 });
---------------------------------------------------------
+
+

@@ -1,51 +1,170 @@
-import express from "express";
+INDEX.JS (com DB + Telegram Webhook) — cole por cima do seu index.js
+========================================================
+
+1) Antes de rodar:
+   - Crie um arquivo .env na raiz do projeto com:
+     BOT_TOKEN=COLE_AQUI_SEU_TOKEN_DO_BOTFATHER
+     (opcional) PORT=3000
+
+2) Instale dependências (se ainda não tiver):
+   npm i express better-sqlite3 dotenv
+
+3) Suba no Render e defina a variável de ambiente BOT_TOKEN
+   (Environment Variables)
+
+4) Depois do deploy, defina o webhook (uma vez):
+   https://api.telegram.org/bot<SEU_TOKEN>/setWebhook?url=https://SEU_DOMINIO_NO_RENDER/telegram/webhook
+
+========================================================
+Código:
+--------------------------------------------------------
+require('dotenv').config();
+
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const Database = require('better-sqlite3');
 
 const app = express();
 app.use(express.json());
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // ex: https://agente-zap.onrender.com
+// =====================
+// 1) CONFIG BÁSICA
+// =====================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error('ERRO: BOT_TOKEN não encontrado. Configure no .env ou no Render.');
+  process.exit(1);
+}
 
-app.get("/", (req, res) => {
-  res.send("OK - servidor no ar");
+const PORT = process.env.PORT || 3000;
+
+// =====================
+// 2) BANCO (SQLite)
+// =====================
+const dbDir = path.join(__dirname, 'db');
+if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+
+const dbPath = path.join(dbDir, 'bot.db');
+const db = new Database(dbPath);
+
+// Tabelas básicas (você pode evoluir depois)
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  telegram_user_id INTEGER NOT NULL UNIQUE,
+  username TEXT,
+  first_name TEXT,
+  last_name TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  telegram_user_id INTEGER NOT NULL,
+  chat_id INTEGER NOT NULL,
+  message_id INTEGER,
+  text TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(telegram_user_id, created_at);
+`);
+
+const upsertUser = db.prepare(`
+INSERT INTO users (telegram_user_id, username, first_name, last_name)
+VALUES (@telegram_user_id, @username, @first_name, @last_name)
+ON CONFLICT(telegram_user_id) DO UPDATE SET
+  username=excluded.username,
+  first_name=excluded.first_name,
+  last_name=excluded.last_name
+`);
+
+const insertMessage = db.prepare(`
+INSERT INTO messages (telegram_user_id, chat_id, message_id, text)
+VALUES (@telegram_user_id, @chat_id, @message_id, @text)
+`);
+
+// =====================
+// 3) FUNÇÃO: ENVIAR MSG
+// =====================
+async function sendTelegramMessage(chatId, text) {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text })
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    console.error('Erro sendMessage:', res.status, body);
+    return false;
+  }
+  return true;
+}
+
+// =====================
+// 4) ROTAS
+// =====================
+
+// Healthcheck (para você testar no browser)
+app.get('/', (req, res) => {
+  res.status(200).send('OK - bot rodando');
 });
 
-app.post("/telegram/webhook", async (req, res) => {
+// IMPORTANTE:
+// O Telegram envia UPDATE via POST no webhook.
+// Se você abrir no navegador, vai dar "Cannot GET /telegram/webhook" (isso é normal).
+app.post('/telegram/webhook', async (req, res) => {
   try {
-    // responde rápido pro Telegram
+    const update = req.body;
+
+    // Responde rápido pro Telegram (boa prática)
     res.sendStatus(200);
 
-    if (!TELEGRAM_BOT_TOKEN) {
-      console.log("❌ TELEGRAM_BOT_TOKEN não configurado");
-      return;
-    }
-
-    const update = req.body;
-    const msg = update?.message;
-
+    // Só processa mensagens de texto
+    const msg = update.message;
     if (!msg || !msg.text) return;
 
     const chatId = msg.chat.id;
-    const text = msg.text;
+    const from = msg.from || {};
 
-    const reply = `Recebi: ${text}`;
-
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: reply
-      }),
+    // Salva/atualiza usuário
+    upsertUser.run({
+      telegram_user_id: from.id,
+      username: from.username || null,
+      first_name: from.first_name || null,
+      last_name: from.last_name || null
     });
 
-    console.log("✅ Mensagem respondida no Telegram");
+    // Salva mensagem
+    insertMessage.run({
+      telegram_user_id: from.id,
+      chat_id: chatId,
+      message_id: msg.message_id || null,
+      text: msg.text
+    });
+
+    // Resposta simples (teste)
+    // Depois trocamos por "menu" / financeiro / produção / vendas
+    if (msg.text.toLowerCase() === '/start') {
+      await sendTelegramMessage(chatId, 'Oi! Eu sou o ADM. Envie uma mensagem e eu registro no banco.');
+      return;
+    }
+
+    await sendTelegramMessage(chatId, `Recebi: ${msg.text}`);
   } catch (err) {
-    console.log("🔥 ERRO /telegram/webhook:", err);
+    console.error('Erro no webhook:', err);
+    // Mesmo com erro, a resposta pro Telegram já foi enviada.
   }
 });
 
-const PORT = process.env.PORT || 3000;
+// =====================
+// 5) START
+// =====================
 app.listen(PORT, () => {
-  console.log(`✅ Rodando na porta ${PORT}`);
+  console.log(`Servidor rodando na porta ${PORT}`);
+  console.log('DB em:', dbPath);
 });
+--------------------------------------------------------

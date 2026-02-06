@@ -1,104 +1,51 @@
 import express from "express";
-import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-// =====================
-// ENV VARS (Render)
-// =====================
-const VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "zap123";
-const WA_TOKEN = process.env.WA_TOKEN; // obrigatório
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID; // obrigatório
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // ex: https://agente-zap.onrender.com
 
-// =====================
-// ROTA RAIZ (TESTE)
-// =====================
 app.get("/", (req, res) => {
-  res.send("Servidor rodando corretamente 🚀");
+  res.send("OK - servidor no ar");
 });
 
-// =====================
-// VERIFICAÇÃO WHATSAPP (GET)
-// =====================
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ Webhook verificado com sucesso");
-    return res.status(200).send(challenge);
-  } else {
-    console.log("❌ Falha na verificação do webhook", { mode, token });
-    return res.sendStatus(403);
-  }
-});
-
-// =====================
-// RECEBER EVENTOS (POST)
-// =====================
-app.post("/webhook", async (req, res) => {
+app.post("/telegram/webhook", async (req, res) => {
   try {
-    // Responde rápido para o WhatsApp não reenviar
+    // responde rápido pro Telegram
     res.sendStatus(200);
 
-    const body = req.body;
-    console.log("📩 EVENTO RECEBIDO:", JSON.stringify(body, null, 2));
-
-    const entry = body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-
-    const message = value?.messages?.[0];
-    if (!message) return;
-
-    const from = message.from; // número do cliente
-    const msgType = message.type;
-
-    if (msgType !== "text") return;
-
-    const text = message.text?.body || "";
-
-    if (!WA_TOKEN || !PHONE_NUMBER_ID) {
-      console.log("❌ WA_TOKEN ou PHONE_NUMBER_ID não configurados");
+    if (!TELEGRAM_BOT_TOKEN) {
+      console.log("❌ TELEGRAM_BOT_TOKEN não configurado");
       return;
     }
 
-    // ⚠️ TEMPLATE STRING CORRETA (CRASE `)
-    const replyText = `Recebi sua mensagem: ${text}`;
+    const update = req.body;
+    const msg = update?.message;
 
-    const url = `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`;
+    if (!msg || !msg.text) return;
 
-    const payload = {
-      messaging_product: "whatsapp",
-      to: from,
-      type: "text",
-      text: { body: replyText },
-    };
+    const chatId = msg.chat.id;
+    const text = msg.text;
 
-    const response = await fetch(url, {
+    const reply = `Recebi: ${text}`;
+
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${WA_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: reply
+      }),
     });
 
-    const data = await response.json();
-    console.log("✅ RESPOSTA ENVIADA:", data);
-
+    console.log("✅ Mensagem respondida no Telegram");
   } catch (err) {
-    console.log("🔥 ERRO NO /webhook:", err);
+    console.log("🔥 ERRO /telegram/webhook:", err);
   }
 });
 
-// =====================
-// START SERVER
-// =====================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ Servidor rodando na porta ${PORT}`);
+  console.log(`✅ Rodando na porta ${PORT}`);
 });
-

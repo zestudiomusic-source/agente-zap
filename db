@@ -1,0 +1,83 @@
+// index.txt
+const express = require("express");
+const bodyParser = require("body-parser");
+const axios = require("axios");
+const db = require("./db");
+
+const app = express();
+app.use(bodyParser.json());
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+
+app.post("/telegram/webhook", async (req, res) => {
+  try {
+    const msg = req.body.message;
+    if (!msg || !msg.text) return res.sendStatus(200);
+
+    const chatId = msg.chat.id;
+    const text = msg.text.toLowerCase();
+
+    let reply = "Comando não reconhecido.";
+
+    if (text === "/start") {
+      reply = "Bot ADM ativo. Use: venda, gasto ou producao.";
+    }
+
+    if (text.startsWith("venda")) {
+      const parts = text.split(" ");
+      const valor = parseFloat(parts[1]);
+      const cliente = parts[3];
+      const item = parts[5];
+
+      db.prepare(
+        "INSERT INTO vendas (user_id, valor, cliente, item) VALUES (?,?,?,?)"
+      ).run(chatId, valor, cliente, item);
+
+      reply = `Venda registrada: R$ ${valor}`;
+    }
+
+    if (text.startsWith("gasto")) {
+      const parts = text.split(" ");
+      const valor = parseFloat(parts[1]);
+      const categoria = parts[3];
+      const descricao = parts.slice(5).join(" ");
+
+      db.prepare(
+        "INSERT INTO gastos (user_id, valor, categoria, descricao) VALUES (?,?,?,?)"
+      ).run(chatId, valor, categoria, descricao);
+
+      reply = `Gasto registrado: R$ ${valor}`;
+    }
+
+    if (text.startsWith("producao")) {
+      const parts = text.split(" ");
+      const pedido = parts[1];
+      const cliente = parts[3];
+      const status = parts[5];
+
+      db.prepare(
+        "INSERT INTO producao (user_id, pedido, cliente, status) VALUES (?,?,?,?)"
+      ).run(chatId, pedido, cliente, status);
+
+      reply = `Produção registrada: ${pedido}`;
+    }
+
+    await axios.post(`${TELEGRAM_API}/sendMessage`, {
+      chat_id: chatId,
+      text: reply,
+    });
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error(err);
+    res.sendStatus(500);
+  }
+});
+
+app.get("/", (req, res) => {
+  res.send("Bot ADM rodando");
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));

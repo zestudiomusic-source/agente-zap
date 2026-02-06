@@ -1,34 +1,27 @@
-// require('dotenv').config();
-
 const express = require('express');
-const path = require('path');
-const fs = require('fs');
 const Database = require('better-sqlite3');
 
 const app = express();
 app.use(express.json());
 
-// =====================
+// =========================
 // 1) CONFIG BÁSICA
-// =====================
+// =========================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error('ERRO: BOT_TOKEN não encontrado. Configure no .env ou no Render.');
+  console.error('ERRO: BOT_TOKEN não encontrado. Configure no Render em Environment Variables.');
   process.exit(1);
 }
 
 const PORT = process.env.PORT || 3000;
 
-// =====================
-// 2) BANCO (SQLite)
-// =====================
-const dbDir = path.join(__dirname, 'db');
-if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
-
-const dbPath = path.join(dbDir, 'bot.db');
+// DB: Render-safe (gravável)
+const dbPath = process.env.DB_PATH || '/tmp/bot.db';
 const db = new Database(dbPath);
 
-// Tabelas básicas (você pode evoluir depois)
+// =========================
+// 2) BANCO (SQLite)
+// =========================
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +41,8 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(telegram_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_user_time
+ON messages(telegram_user_id, created_at);
 `);
 
 const upsertUser = db.prepare(`
@@ -65,11 +59,12 @@ INSERT INTO messages (telegram_user_id, chat_id, message_id, text)
 VALUES (@telegram_user_id, @chat_id, @message_id, @text)
 `);
 
-// =====================
+// =========================
 // 3) FUNÇÃO: ENVIAR MSG
-// =====================
+// =========================
 async function sendTelegramMessage(chatId, text) {
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -84,18 +79,18 @@ async function sendTelegramMessage(chatId, text) {
   return true;
 }
 
-// =====================
+// =========================
 // 4) ROTAS
-// =====================
+// =========================
 
-// Healthcheck (para você testar no browser)
+// Healthcheck (pra você testar no browser)
 app.get('/', (req, res) => {
   res.status(200).send('OK - bot rodando');
 });
 
 // IMPORTANTE:
-// O Telegram envia UPDATE via POST no webhook.
-// Se você abrir no navegador, vai dar "Cannot GET /telegram/webhook" (isso é normal).
+// - Telegram envia UPDATE via POST no webhook.
+// - Se você abrir /telegram/webhook no navegador, vai dar "Cannot GET" (normal).
 app.post('/telegram/webhook', async (req, res) => {
   try {
     const update = req.body;
@@ -127,26 +122,23 @@ app.post('/telegram/webhook', async (req, res) => {
     });
 
     // Resposta simples (teste)
-    // Depois trocamos por "menu" / financeiro / produção / vendas
-    if (msg.text.toLowerCase() === '/start') {
-      await sendTelegramMessage(chatId, 'Oi! Eu sou o ADM. Envie uma mensagem e eu registro no banco.');
+    // Depois a gente troca por menu: /menu /financeiro /producao /vendas
+    if (msg.text.trim().toLowerCase() === '/start') {
+      await sendTelegramMessage(chatId, 'Oi! Eu sou o ADM. Envie uma mensagem e eu registro no banco ✅');
       return;
     }
 
     await sendTelegramMessage(chatId, `Recebi: ${msg.text}`);
   } catch (err) {
     console.error('Erro no webhook:', err);
-    // Mesmo com erro, a resposta pro Telegram já foi enviada.
+    // Mesmo com erro, o Telegram já recebeu 200 acima.
   }
 });
 
-// =====================
+// =========================
 // 5) START
-// =====================
+// =========================
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
   console.log('DB em:', dbPath);
 });
-
-
-

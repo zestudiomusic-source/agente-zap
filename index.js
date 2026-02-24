@@ -72,6 +72,57 @@ async function tgSendMessage(chatId, text, extra = {}) {
     ...extra,
   });
 }
+// ===== WHATSAPP CLOUD API WEBHOOK =====
+const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || ""; // tem que ser igual ao do Meta
+
+app.get("/wa/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  console.log("WA GET verify hit:", { mode, token: token ? "***" : "", challenge: !!challenge });
+
+  if (mode === "subscribe" && token && token === WA_VERIFY_TOKEN) {
+    console.log("WA webhook verified ✅");
+    return res.status(200).send(challenge);
+  }
+  console.log("WA webhook verify failed ❌");
+  return res.sendStatus(403);
+});
+
+app.post("/wa/webhook", async (req, res) => {
+  // Meta exige resposta rápida 200
+  res.sendStatus(200);
+
+  try {
+    console.log("WA POST update:", JSON.stringify(req.body).slice(0, 1200));
+
+    const body = req.body;
+
+    // Estrutura padrão: entry -> changes -> value
+    const entry = body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+
+    const messages = value?.messages;
+    if (!messages || !messages.length) return;
+
+    for (const m of messages) {
+      const from = m.from; // telefone do cliente (wa_id)
+      const text = m.text?.body || "";
+      const timestamp = m.timestamp;
+
+      // Aqui você faz: criar lead, salvar mensagem no banco, etc.
+      // Exemplo: só notificar no Telegram por enquanto:
+      await tgSendMessage(
+        ADMIN_ID, // ou seu chatId admin se você tiver
+        `📲 <b>Novo WhatsApp</b>\nDe: <b>${from}</b>\nMsg: ${text}\nTS: ${timestamp}`
+      );
+    }
+  } catch (err) {
+    console.error("Erro WA webhook:", err);
+  }
+});
 
 // ================= MENU =================
 function menuKeyboard() {
@@ -266,3 +317,4 @@ app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
   console.log("Banco:", dbPath);
 });
+

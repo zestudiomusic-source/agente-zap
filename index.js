@@ -1,24 +1,57 @@
+/**
+ * AGENTE ERP (Telegram + WhatsApp + IA) — versão integrada
+ * - Telegram: painel administrativo + wizard + menus + modo Chat IA
+ * - WhatsApp: captura mensagens (lead) via webhook (GET verify + POST receive)
+ * - CRM/Vendas: pipeline (Em andamento / Concluídas / Perdidas) + converter venda em pedido
+ * - Pedidos: wizard completo (Nome/Contato/Endereço/Descrição/Obs/Valor/Data buscar/Data entregar) + status produção
+ * - Produção: status por botões + filtros + atrasados
+ * - Financeiro: registrar pagamentos + pendentes/parciais/pagos + caixa do dia + fechar dia
+ * - IA: Chat IA + Insights (alertas, estratégias, gargalos)
+ *
+ * Webhooks:
+ * - Telegram: POST /webhook
+ * - WhatsApp: GET/POST /wa/webhook
+ *
+ * ENV no Render (mínimo):
+ * - TELEGRAM_ADMIN_ID          (seu user id)
+ * - BOT_TOKEN                  (ou TELEGRAM_BOT_TOKEN)
+ * - OPENAI_API_KEY             (para IA)
+ * - WA_VERIFY_TOKEN            (para verificação do webhook WA)
+ *
+ * ENV WA (para enviar mensagens futuramente, não usado agora):
+ * - WA_TOKEN
+ * - PHONE_NUMBER_ID
+ */
+
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const Database = require("better-sqlite3");
 
-// ================= CONFIG =================
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_ID = Number(process.env.TELEGRAM_ADMIN_ID);
+// ===================== CONFIG =====================
+const BOT_TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+const ADMIN_ID = Number(process.env.TELEGRAM_ADMIN_ID || 0);
 const PORT = process.env.PORT || 3000;
 
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || "";
+
 if (!BOT_TOKEN) {
-  console.error("BOT_TOKEN não configurado!");
+  console.error("ERRO: BOT_TOKEN/TELEGRAM_BOT_TOKEN não configurado!");
   process.exit(1);
 }
-
 if (!ADMIN_ID) {
-  console.error("TELEGRAM_ADMIN_ID não configurado!");
+  console.error("ERRO: TELEGRAM_ADMIN_ID não configurado!");
   process.exit(1);
 }
 
-// ================= DATABASE =================
+// ===================== APP =====================
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+
+// ===================== DATABASE =====================
 const isRender = !!process.env.RENDER;
 const dbPath = isRender
   ? path.join("/tmp", "bot.db")
@@ -26,33 +59,93 @@ const dbPath = isRender
 
 if (!isRender) {
   const dbDir = path.join(__dirname, "db");
-  if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir);
+  if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
 }
 
 const db = new Database(dbPath);
 
+// ===================== DB SCHEMA =====================
 db.exec(`
+PRAGMA journal_mode=WAL;
+
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   nome TEXT,
   contato TEXT,
   endereco TEXT,
   descricao TEXT,
+  observacoes TEXT,
   valor REAL,
   data_buscar TEXT,
   data_entregar TEXT,
   status_producao TEXT DEFAULT 'Aguardando produção',
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS wizard (
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER,
+  valor REAL,
+  metodo TEXT,
+  observacao TEXT,
+  paid_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(order_id) REFERENCES orders(id)
+);
+
+-- CRM / VENDAS
+CREATE TABLE IF NOT EXISTS deals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  nome TEXT,
+  contato TEXT,
+  endereco TEXT,
+  descricao TEXT,
+  observacoes TEXT,
+  valor_estimado REAL,
+  etapa TEXT DEFAULT 'Lead novo',
+  origem TEXT DEFAULT 'manual',
+  wa_id TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel TEXT,           -- 'whatsapp' / 'telegram'
+  wa_id TEXT,             -- telefone do WA (string)
+  chat_id TEXT,           -- chat id telegram (string)
+  direction TEXT,         -- 'in' ou 'out'
+  text TEXT,
+  raw_json TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT,
+  ref_type TEXT,
+  ref_id TEXT,
+  payload_json TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS insights (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT,
+  insight_text TEXT,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- ESTADOS (wizard e modo IA)
+CREATE TABLE IF NOT EXISTS state (
   chat_id INTEGER PRIMARY KEY,
+  mode TEXT,              -- 'NONE' | 'ORDER_WIZ' | 'DEAL_WIZ' | 'PAY_WIZ' | 'AI_CHAT' | 'SEARCH' | 'SET_STATUS'
   step TEXT,
-  data TEXT
+  payload_json TEXT,
+  updated_at TEXT DEFAULT (datetime('now'))
 );
 `);
 
-// ================= TELEGRAM =================
+// ===================== TELEGRAM =====================
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 async function tg(method, body) {
@@ -61,26 +154,297 @@ async function tg(method, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  return res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!data.ok) console.error("Telegram error:", method, data);
+  return data;
 }
 
 async function tgSendMessage(chatId, text, extra = {}) {
-  return tg("sendMessage", {
+  return tg("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", ...extra });
+}
+
+async function tgEditMessage(chatId, messageId, text, extra = {}) {
+  return tg("editMessageText", {
     chat_id: chatId,
+    message_id: messageId,
     text,
     parse_mode: "HTML",
     ...extra,
   });
 }
-// ===== WHATSAPP CLOUD API WEBHOOK =====
-const WA_VERIFY_TOKEN = process.env.WA_VERIFY_TOKEN || ""; // tem que ser igual ao do Meta
 
+async function tgAnswerCallbackQuery(id) {
+  return tg("answerCallbackQuery", { callback_query_id: id });
+}
+
+// ===================== HELPERS =====================
+function kb(rows) {
+  return { reply_markup: { inline_keyboard: rows } };
+}
+
+function moneyBR(v) {
+  const n = Number(v || 0);
+  return n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+}
+
+function todayISO() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function parseDateToISO(s) {
+  if (!s) return null;
+  const t = String(s).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+  const m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return null;
+  return `${m[3]}-${m[2]}-${m[1]}`;
+}
+
+function setState(chatId, mode, step = "", payload = {}) {
+  db.prepare(`
+    INSERT INTO state(chat_id, mode, step, payload_json, updated_at)
+    VALUES(?,?,?,?, datetime('now'))
+    ON CONFLICT(chat_id) DO UPDATE SET
+      mode=excluded.mode,
+      step=excluded.step,
+      payload_json=excluded.payload_json,
+      updated_at=datetime('now')
+  `).run(chatId, mode, step, JSON.stringify(payload || {}));
+}
+
+function getState(chatId) {
+  const row = db.prepare(`SELECT mode, step, payload_json FROM state WHERE chat_id=?`).get(chatId);
+  if (!row) return { mode: "NONE", step: "", payload: {} };
+  let payload = {};
+  try { payload = row.payload_json ? JSON.parse(row.payload_json) : {}; } catch { payload = {}; }
+  return { mode: row.mode || "NONE", step: row.step || "", payload };
+}
+
+function clearState(chatId) {
+  db.prepare(`DELETE FROM state WHERE chat_id=?`).run(chatId);
+}
+
+function logEvent(event_type, ref_type, ref_id, payload) {
+  db.prepare(`INSERT INTO events(event_type, ref_type, ref_id, payload_json) VALUES (?,?,?,?)`)
+    .run(event_type, String(ref_type || ""), String(ref_id || ""), JSON.stringify(payload || {}));
+}
+
+function saveMessage({ channel, wa_id, chat_id, direction, text, raw }) {
+  db.prepare(`
+    INSERT INTO messages(channel, wa_id, chat_id, direction, text, raw_json)
+    VALUES(?,?,?,?,?,?)
+  `).run(channel, wa_id || null, chat_id || null, direction, text || "", raw ? JSON.stringify(raw) : null);
+}
+
+function orderFinancial(orderId) {
+  const o = db.prepare(`SELECT valor FROM orders WHERE id=?`).get(orderId);
+  if (!o) return null;
+  const paid = db.prepare(`SELECT COALESCE(SUM(valor),0) s FROM payments WHERE order_id=?`).get(orderId).s;
+  const total = Number(o.valor || 0);
+  let status = "PENDENTE";
+  if (paid > 0 && paid + 1e-6 < total) status = "PARCIAL";
+  if (paid + 1e-6 >= total) status = "PAGO";
+  return { total, paid, status };
+}
+
+function kpis() {
+  const t = todayISO();
+  const pedidosHoje = db.prepare(`SELECT COUNT(*) c FROM orders WHERE substr(created_at,1,10)=?`).get(t).c;
+  const vendasHoje = db.prepare(`SELECT COUNT(*) c FROM deals WHERE substr(updated_at,1,10)=? AND etapa='Concluída'`).get(t).c;
+  const caixaHoje = db.prepare(`SELECT COALESCE(SUM(valor),0) s FROM payments WHERE substr(paid_at,1,10)=?`).get(t).s;
+  const atrasados = db.prepare(`
+    SELECT COUNT(*) c FROM orders
+    WHERE data_entregar IS NOT NULL AND data_entregar < ? AND status_producao != 'Entregue'
+  `).get(t).c;
+  return { date: t, pedidosHoje, vendasHoje, caixaHoje, atrasados };
+}
+
+// ===================== MENUS =====================
+function MENU_MAIN() {
+  return kb([
+    [{ text: "💰 Vendas (CRM)", callback_data: "M:DEALS" }, { text: "📦 Pedidos", callback_data: "M:ORDERS" }],
+    [{ text: "🏭 Produção", callback_data: "M:PROD" }, { text: "📊 Financeiro", callback_data: "M:FIN" }],
+    [{ text: "📆 Agenda", callback_data: "M:AGENDA" }, { text: "🧠 IA", callback_data: "M:AI" }],
+    [{ text: "⚙️ Sistema", callback_data: "M:SYSTEM" }],
+  ]);
+}
+
+function MENU_DEALS() {
+  return kb([
+    [{ text: "➕ Nova Venda", callback_data: "D:NEW" }],
+    [{ text: "🟡 Em andamento", callback_data: "D:LIST:AND" }, { text: "🟢 Concluídas", callback_data: "D:LIST:DONE" }],
+    [{ text: "🔴 Perdidas", callback_data: "D:LIST:LOST" }],
+    [{ text: "🔎 Buscar (ID/Nome/Contato)", callback_data: "D:SEARCH" }],
+    [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function MENU_ORDERS() {
+  return kb([
+    [{ text: "➕ Criar Pedido", callback_data: "O:NEW" }],
+    [{ text: "📋 Ver Pedidos (20)", callback_data: "O:LIST20" }],
+    [{ text: "🔎 Buscar (ID/Nome/Contato)", callback_data: "O:SEARCH" }],
+    [{ text: "🏷️ Alterar Status Produção", callback_data: "O:SETSTATUS" }],
+    [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function MENU_PROD() {
+  return kb([
+    [{ text: "🧵 Aguardando", callback_data: "P:LIST:A" }, { text: "⚙️ Em produção", callback_data: "P:LIST:E" }],
+    [{ text: "✅ Pronto", callback_data: "P:LIST:P" }, { text: "🚚 Entregue", callback_data: "P:LIST:T" }],
+    [{ text: "⚠️ Problema", callback_data: "P:LIST:X" }],
+    [{ text: "⏱️ Atrasados", callback_data: "P:LATE" }],
+    [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function MENU_FIN() {
+  return kb([
+    [{ text: "💵 Registrar Pagamento", callback_data: "F:PAY" }],
+    [{ text: "🧾 Pendentes", callback_data: "F:LIST:PEND" }, { text: "🟡 Parciais", callback_data: "F:LIST:PART" }],
+    [{ text: "✅ Pagos", callback_data: "F:LIST:PAID" }],
+    [{ text: "📊 Caixa do Dia", callback_data: "F:CASH:TODAY" }],
+    [{ text: "✅ Fechar Dia", callback_data: "F:CLOSE:DAY" }],
+    [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function MENU_AGENDA() {
+  return kb([
+    [{ text: "📦 Buscas Hoje", callback_data: "A:PICKUP:TODAY" }, { text: "🚚 Entregas Hoje", callback_data: "A:DELIV:TODAY" }],
+    [{ text: "📅 Próximas Entregas (7d)", callback_data: "A:DELIV:WEEK" }],
+    [{ text: "⏱️ Atrasados", callback_data: "A:LATE" }],
+    [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function MENU_AI() {
+  return kb([
+    [{ text: "💬 Chat IA", callback_data: "AI:CHAT" }, { text: "🧠 Insights IA", callback_data: "AI:INSIGHTS" }],
+    [{ text: "⚠️ Alertas do Dia", callback_data: "AI:ALERTS" }],
+    [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function MENU_SYSTEM() {
+  return kb([
+    [{ text: "📌 Status DB", callback_data: "S:DB" }],
+    [{ text: "📲 Status WhatsApp", callback_data: "S:WA" }],
+    [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function KB_CONFIRM(yes, no) {
+  return kb([[{ text: "✅ SIM", callback_data: yes }, { text: "❌ NÃO", callback_data: no }]]);
+}
+
+function KB_STATUS() {
+  return kb([
+    [{ text: "🧵 Aguardando produção", callback_data: "ST:Aguardando produção" }],
+    [{ text: "⚙️ Em produção", callback_data: "ST:Em produção" }],
+    [{ text: "✅ Pronto", callback_data: "ST:Pronto" }],
+    [{ text: "🚚 Entregue", callback_data: "ST:Entregue" }],
+    [{ text: "⚠️ Problema", callback_data: "ST:Problema" }],
+    [{ text: "⬅️ Cancelar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function KB_PAY_METHOD() {
+  return kb([
+    [{ text: "Pix", callback_data: "PM:Pix" }, { text: "Dinheiro", callback_data: "PM:Dinheiro" }],
+    [{ text: "Cartão", callback_data: "PM:Cartão" }, { text: "Transferência", callback_data: "PM:Transferência" }],
+    [{ text: "⬅️ Cancelar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+function KB_AI_CHAT() {
+  return kb([
+    [{ text: "⬅️ Sair do Chat IA", callback_data: "AI:EXIT" }, { text: "🧹 Resetar conversa IA", callback_data: "AI:RESET" }],
+    [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+  ]);
+}
+
+// ===================== OPENAI (IA) =====================
+async function openaiAsk({ input, previous_response_id }) {
+  if (!OPENAI_API_KEY) {
+    return { ok: false, text: "IA não configurada. Coloque OPENAI_API_KEY no Render.", previous_response_id: null };
+  }
+
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      input,
+      previous_response_id: previous_response_id || undefined,
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!data || data.error) {
+    return { ok: false, text: `Erro IA: ${data?.error?.message || "falha na API"}`, previous_response_id: null };
+  }
+
+  const text = typeof data.output_text === "string" ? data.output_text : "";
+  return { ok: true, text: text || "Sem resposta.", previous_response_id: data.id || previous_response_id || null };
+}
+
+function buildContextSummary() {
+  const k = kpis();
+
+  // Pedidos atrasados (top 5)
+  const late = db.prepare(`
+    SELECT id, nome, valor, data_entregar, status_producao
+    FROM orders
+    WHERE data_entregar IS NOT NULL AND data_entregar < ? AND status_producao != 'Entregue'
+    ORDER BY data_entregar ASC
+    LIMIT 5
+  `).all(k.date);
+
+  // Vendas em andamento (top 5)
+  const and = db.prepare(`
+    SELECT id, nome, contato, valor_estimado, etapa, origem
+    FROM deals
+    WHERE etapa NOT IN ('Concluída','Perdida')
+    ORDER BY updated_at DESC
+    LIMIT 5
+  `).all();
+
+  // Financeiro: pendentes/parciais (top 5)
+  const orders = db.prepare(`SELECT id, nome, valor FROM orders ORDER BY id DESC LIMIT 60`).all();
+  const pend = [];
+  for (const o of orders) {
+    const f = orderFinancial(o.id);
+    if (!f) continue;
+    if ((f.status === "PENDENTE" || f.status === "PARCIAL") && pend.length < 5) {
+      pend.push({ id: o.id, nome: o.nome, total: f.total, paid: f.paid, status: f.status });
+    }
+  }
+
+  return {
+    kpis: k,
+    late_orders: late,
+    deals_in_progress: and,
+    finance_attention: pend,
+  };
+}
+
+// ===================== WHATSAPP WEBHOOK =====================
+// Verificação (Meta chama GET para validar)
 app.get("/wa/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  console.log("WA GET verify hit:", { mode, token: token ? "***" : "", challenge: !!challenge });
+  console.log("WA VERIFY HIT:", { mode, hasToken: !!token, hasChallenge: !!challenge });
 
   if (mode === "subscribe" && token && token === WA_VERIFY_TOKEN) {
     console.log("WA webhook verified ✅");
@@ -90,33 +454,67 @@ app.get("/wa/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
+// Receber mensagens (captura lead + salva no banco + notifica Telegram)
 app.post("/wa/webhook", async (req, res) => {
-  // Meta exige resposta rápida 200
   res.sendStatus(200);
 
   try {
-    console.log("WA POST update:", JSON.stringify(req.body).slice(0, 1200));
-
     const body = req.body;
 
-    // Estrutura padrão: entry -> changes -> value
     const entry = body.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
-
     const messages = value?.messages;
-    if (!messages || !messages.length) return;
+
+    if (!messages?.length) return;
 
     for (const m of messages) {
-      const from = m.from; // telefone do cliente (wa_id)
-      const text = m.text?.body || "";
-      const timestamp = m.timestamp;
+      const wa_id = m.from; // telefone do cliente
+      const text = m.text?.body || "[Mensagem não textual]";
+      saveMessage({ channel: "whatsapp", wa_id, direction: "in", text, raw: body });
 
-      // Aqui você faz: criar lead, salvar mensagem no banco, etc.
-      // Exemplo: só notificar no Telegram por enquanto:
+      // upsert deal (lead) automaticamente
+      const existing = db.prepare(`SELECT id, etapa FROM deals WHERE wa_id=? ORDER BY id DESC LIMIT 1`).get(wa_id);
+      let dealId = existing?.id;
+
+      if (!dealId) {
+        const info = {
+          nome: null,
+          contato: wa_id,
+          endereco: null,
+          descricao: text,
+          observacoes: null,
+          valor_estimado: null,
+          etapa: "Lead novo",
+          origem: "whatsapp",
+          wa_id,
+        };
+        const r = db.prepare(`
+          INSERT INTO deals(nome, contato, endereco, descricao, observacoes, valor_estimado, etapa, origem, wa_id, updated_at)
+          VALUES(?,?,?,?,?,?,?,?,?, datetime('now'))
+        `).run(
+          info.nome,
+          info.contato,
+          info.endereco,
+          info.descricao,
+          info.observacoes,
+          info.valor_estimado,
+          info.etapa,
+          info.origem,
+          info.wa_id
+        );
+        dealId = r.lastInsertRowid;
+        logEvent("wa_lead_created", "deal", dealId, { wa_id, first_message: text });
+      } else {
+        // Atualiza updated_at e, se estava Perdida/Concluída, não mexe automaticamente
+        db.prepare(`UPDATE deals SET updated_at=datetime('now') WHERE id=?`).run(dealId);
+        logEvent("wa_message_in", "deal", dealId, { wa_id, text });
+      }
+
+      // Notifica no Telegram (painel)
       await tgSendMessage(
-        ADMIN_ID, // ou seu chatId admin se você tiver
-        `📲 <b>Novo WhatsApp</b>\nDe: <b>${from}</b>\nMsg: ${text}\nTS: ${timestamp}`
+        ADMIN_ID,
+        `📲 <b>Novo WhatsApp</b>\n<b>Lead #${dealId}</b>\nDe: <b>${wa_id}</b>\nMsg: ${text}\n\nUse /menu → 💰 Vendas (CRM) para gerenciar.`
       );
     }
   } catch (err) {
@@ -124,197 +522,797 @@ app.post("/wa/webhook", async (req, res) => {
   }
 });
 
-// ================= MENU =================
-function menuKeyboard() {
-  return {
-    inline_keyboard: [
-      [
-        { text: "📦 Pedidos", callback_data: "menu_pedidos" },
-        { text: "📆 Agenda", callback_data: "menu_agenda" },
-      ],
-      [
-        { text: "🏭 Produção", callback_data: "menu_producao" },
-        { text: "💰 Financeiro", callback_data: "menu_financeiro" },
-      ],
-      [
-        { text: "📊 Relatórios", callback_data: "menu_relatorios" },
-        { text: "⚙️ Sistema", callback_data: "menu_sistema" },
-      ],
-    ],
-  };
+// ===================== TELEGRAM HANDLERS =====================
+async function showMainMenu(chatId, editMsgId = null) {
+  const text = "📊 <b>Painel Administrativo</b>\nEscolha um módulo:";
+  if (editMsgId) return tgEditMessage(chatId, editMsgId, text, MENU_MAIN());
+  return tgSendMessage(chatId, text, MENU_MAIN());
 }
 
-function pedidosKeyboard() {
-  return {
-    inline_keyboard: [
-      [{ text: "➕ Criar Pedido", callback_data: "criar_pedido" }],
-      [{ text: "📋 Ver Pedidos", callback_data: "ver_pedidos" }],
-      [{ text: "⬅️ Voltar", callback_data: "menu_principal" }],
-    ],
-  };
+function isAdmin(userId) {
+  return Number(userId) === ADMIN_ID;
 }
 
-// ================= WIZARD =================
-function setWizard(chatId, step, data = {}) {
-  db.prepare(`
-    INSERT INTO wizard (chat_id, step, data)
-    VALUES (?, ?, ?)
-    ON CONFLICT(chat_id) DO UPDATE SET step=excluded.step, data=excluded.data
-  `).run(chatId, step, JSON.stringify(data));
+// ===================== REPORTS / LIST BUILDERS =====================
+function listDealsByType(type) {
+  let where = "";
+  if (type === "AND") where = `etapa NOT IN ('Concluída','Perdida')`;
+  if (type === "DONE") where = `etapa='Concluída'`;
+  if (type === "LOST") where = `etapa='Perdida'`;
+
+  const rows = db.prepare(`
+    SELECT id, nome, contato, valor_estimado, etapa, origem, updated_at
+    FROM deals
+    WHERE ${where}
+    ORDER BY updated_at DESC
+    LIMIT 20
+  `).all();
+
+  if (!rows.length) return "Nenhuma venda encontrada.";
+
+  let txt = "💰 <b>Vendas</b>\n\n";
+  for (const d of rows) {
+    txt += `#${d.id} - ${d.nome || "Sem nome"} (${d.contato || "-"})\n`;
+    txt += `Etapa: <b>${d.etapa}</b> | Origem: ${d.origem}\n`;
+    if (d.valor_estimado != null) txt += `Valor estimado: ${moneyBR(d.valor_estimado)}\n`;
+    txt += `Atualizado: ${d.updated_at}\n\n`;
+  }
+  return txt;
 }
 
-function getWizard(chatId) {
-  const row = db.prepare("SELECT * FROM wizard WHERE chat_id=?").get(chatId);
-  if (!row) return null;
-  return { step: row.step, data: JSON.parse(row.data || "{}") };
+function listOrders(limit = 20) {
+  const rows = db.prepare(`SELECT * FROM orders ORDER BY id DESC LIMIT ?`).all(limit);
+  if (!rows.length) return "Nenhum pedido encontrado.";
+
+  let txt = "📋 <b>Últimos Pedidos</b>\n\n";
+  for (const p of rows) {
+    const f = orderFinancial(p.id);
+    const fin = f ? ` | ${f.status} (${moneyBR(f.paid)}/${moneyBR(f.total)})` : "";
+    txt += `#${p.id} - ${p.nome || "Sem nome"} - ${moneyBR(p.valor)}\n`;
+    txt += `Prod: <b>${p.status_producao}</b>${fin}\n`;
+    if (p.data_entregar) txt += `Entrega: ${p.data_entregar}\n`;
+    txt += `\n`;
+  }
+  return txt;
 }
 
-function clearWizard(chatId) {
-  db.prepare("DELETE FROM wizard WHERE chat_id=?").run(chatId);
+function listOrdersByProdStatus(status) {
+  const rows = db.prepare(`
+    SELECT id, nome, valor, data_entregar, status_producao
+    FROM orders
+    WHERE status_producao=?
+    ORDER BY COALESCE(data_entregar,'9999-12-31') ASC, id DESC
+    LIMIT 30
+  `).all(status);
+
+  if (!rows.length) return `Nenhum pedido em: ${status}`;
+
+  let txt = `🏭 <b>${status}</b>\n\n`;
+  for (const p of rows) {
+    txt += `#${p.id} - ${p.nome || "Sem nome"} - ${moneyBR(p.valor)}\n`;
+    if (p.data_entregar) txt += `Entrega: ${p.data_entregar}\n`;
+    txt += `\n`;
+  }
+  return txt;
 }
 
-// ================= APP =================
-const app = express();
-app.use(express.json());
+function listLateOrders() {
+  const t = todayISO();
+  const rows = db.prepare(`
+    SELECT id, nome, valor, data_entregar, status_producao
+    FROM orders
+    WHERE data_entregar IS NOT NULL AND data_entregar < ? AND status_producao != 'Entregue'
+    ORDER BY data_entregar ASC
+    LIMIT 30
+  `).all(t);
 
-// ================= WEBHOOK =================
+  if (!rows.length) return "✅ Nenhum pedido atrasado.";
+
+  let txt = "⏱️ <b>Pedidos Atrasados</b>\n\n";
+  for (const p of rows) {
+    txt += `#${p.id} - ${p.nome || "Sem nome"} - ${moneyBR(p.valor)}\n`;
+    txt += `Entrega: <b>${p.data_entregar}</b> | Status: ${p.status_producao}\n\n`;
+  }
+  return txt;
+}
+
+function listAgendaPickupToday() {
+  const t = todayISO();
+  const rows = db.prepare(`
+    SELECT id, nome, contato, endereco, data_buscar, status_producao
+    FROM orders
+    WHERE data_buscar = ?
+    ORDER BY id DESC
+    LIMIT 30
+  `).all(t);
+
+  if (!rows.length) return "Nenhuma busca para hoje.";
+
+  let txt = "📦 <b>Buscas de Hoje</b>\n\n";
+  for (const p of rows) {
+    txt += `#${p.id} - ${p.nome || "Sem nome"} | ${p.contato || "-"}\n`;
+    txt += `Endereço: ${p.endereco || "-"}\n`;
+    txt += `Status: ${p.status_producao}\n\n`;
+  }
+  return txt;
+}
+
+function listAgendaDeliveryToday() {
+  const t = todayISO();
+  const rows = db.prepare(`
+    SELECT id, nome, contato, endereco, data_entregar, status_producao
+    FROM orders
+    WHERE data_entregar = ?
+    ORDER BY id DESC
+    LIMIT 30
+  `).all(t);
+
+  if (!rows.length) return "Nenhuma entrega para hoje.";
+
+  let txt = "🚚 <b>Entregas de Hoje</b>\n\n";
+  for (const p of rows) {
+    txt += `#${p.id} - ${p.nome || "Sem nome"} | ${p.contato || "-"}\n`;
+    txt += `Endereço: ${p.endereco || "-"}\n`;
+    txt += `Status: ${p.status_producao}\n\n`;
+  }
+  return txt;
+}
+
+function listAgendaDeliveryWeek() {
+  const t = todayISO();
+  const rows = db.prepare(`
+    SELECT id, nome, valor, data_entregar, status_producao
+    FROM orders
+    WHERE data_entregar IS NOT NULL
+      AND data_entregar >= ?
+      AND data_entregar <= date(?, '+7 day')
+      AND status_producao != 'Entregue'
+    ORDER BY data_entregar ASC
+    LIMIT 50
+  `).all(t, t);
+
+  if (!rows.length) return "Nenhuma entrega nos próximos 7 dias.";
+
+  let txt = "📅 <b>Entregas (próximos 7 dias)</b>\n\n";
+  for (const p of rows) {
+    txt += `${p.data_entregar} — #${p.id} ${p.nome || "Sem nome"} (${moneyBR(p.valor)})\n`;
+    txt += `Status: ${p.status_producao}\n\n`;
+  }
+  return txt;
+}
+
+function listFinanceByType(type) {
+  // varre últimos 200 pedidos pra classificar
+  const rows = db.prepare(`SELECT id, nome, valor FROM orders ORDER BY id DESC LIMIT 200`).all();
+  const out = [];
+  for (const o of rows) {
+    const f = orderFinancial(o.id);
+    if (!f) continue;
+    if (type === "PEND" && f.status === "PENDENTE") out.push({ ...o, ...f });
+    if (type === "PART" && f.status === "PARCIAL") out.push({ ...o, ...f });
+    if (type === "PAID" && f.status === "PAGO") out.push({ ...o, ...f });
+    if (out.length >= 25) break;
+  }
+  if (!out.length) return "Nada encontrado.";
+  let txt = "📊 <b>Financeiro</b>\n\n";
+  for (const p of out) {
+    txt += `#${p.id} - ${p.nome || "Sem nome"}\n`;
+    txt += `Total: ${moneyBR(p.total)} | Pago: ${moneyBR(p.paid)} | <b>${p.status}</b>\n\n`;
+  }
+  return txt;
+}
+
+function cashToday() {
+  const t = todayISO();
+  const sum = db.prepare(`SELECT COALESCE(SUM(valor),0) s FROM payments WHERE substr(paid_at,1,10)=?`).get(t).s;
+  const count = db.prepare(`SELECT COUNT(*) c FROM payments WHERE substr(paid_at,1,10)=?`).get(t).c;
+  return { date: t, sum, count };
+}
+
+// ===================== TELEGRAM WEBHOOK =====================
 app.post("/webhook", async (req, res) => {
   const body = req.body;
 
   try {
-    // ================= CALLBACK BUTTONS =================
+    // ---------- CALLBACK ----------
     if (body.callback_query) {
-      const chatId = body.callback_query.message.chat.id;
-      const userId = body.callback_query.from.id;
-      const data = body.callback_query.data;
+      const q = body.callback_query;
+      const chatId = q.message.chat.id;
+      const msgId = q.message.message_id;
+      const userId = q.from.id;
+      const data = q.data;
 
-      if (userId !== ADMIN_ID) return res.sendStatus(200);
+      await tgAnswerCallbackQuery(q.id);
 
-      if (data === "menu_principal") {
-        await tgSendMessage(chatId, "📊 Painel Administrativo", {
-          reply_markup: menuKeyboard(),
-        });
+      if (!isAdmin(userId)) return res.sendStatus(200);
+
+      // Menus
+      if (data === "M:MAIN") { await showMainMenu(chatId, msgId); return res.sendStatus(200); }
+      if (data === "M:DEALS") { await tgEditMessage(chatId, msgId, "💰 <b>Vendas (CRM)</b>", MENU_DEALS()); return res.sendStatus(200); }
+      if (data === "M:ORDERS") { await tgEditMessage(chatId, msgId, "📦 <b>Pedidos</b>", MENU_ORDERS()); return res.sendStatus(200); }
+      if (data === "M:PROD") { await tgEditMessage(chatId, msgId, "🏭 <b>Produção</b>", MENU_PROD()); return res.sendStatus(200); }
+      if (data === "M:FIN") { await tgEditMessage(chatId, msgId, "📊 <b>Financeiro</b>", MENU_FIN()); return res.sendStatus(200); }
+      if (data === "M:AGENDA") { await tgEditMessage(chatId, msgId, "📆 <b>Agenda</b>", MENU_AGENDA()); return res.sendStatus(200); }
+      if (data === "M:AI") { await tgEditMessage(chatId, msgId, "🧠 <b>IA</b>", MENU_AI()); return res.sendStatus(200); }
+      if (data === "M:SYSTEM") { await tgEditMessage(chatId, msgId, "⚙️ <b>Sistema</b>", MENU_SYSTEM()); return res.sendStatus(200); }
+
+      // -------- CRM/VENDAS --------
+      if (data === "D:NEW") {
+        setState(chatId, "DEAL_WIZ", "nome", {});
+        await tgSendMessage(chatId, "💰 <b>Nova Venda</b>\nDigite o <b>NOME</b> do cliente:");
+        return res.sendStatus(200);
       }
 
-      if (data === "menu_pedidos") {
-        await tgSendMessage(chatId, "📦 MÓDULO PEDIDOS", {
-          reply_markup: pedidosKeyboard(),
-        });
+      if (data.startsWith("D:LIST:")) {
+        const type = data.split(":")[2];
+        const txt = listDealsByType(type);
+        await tgSendMessage(chatId, txt);
+        return res.sendStatus(200);
       }
 
-      if (data === "criar_pedido") {
-        setWizard(chatId, "nome", {});
-        await tgSendMessage(chatId, "Digite o NOME do cliente:");
+      if (data === "D:SEARCH") {
+        setState(chatId, "SEARCH", "deal", { last: "deal" });
+        await tgSendMessage(chatId, "🔎 Digite: <b>ID</b> ou <b>nome</b> ou <b>contato</b> para buscar venda:");
+        return res.sendStatus(200);
       }
 
-      if (data === "ver_pedidos") {
-        const pedidos = db
-          .prepare("SELECT * FROM orders ORDER BY id DESC LIMIT 10")
-          .all();
+      if (data.startsWith("D:SET:")) {
+        // D:SET:<dealId>:<etapa>
+        const parts = data.split(":");
+        const dealId = Number(parts[2]);
+        const etapa = parts.slice(3).join(":");
+        db.prepare(`UPDATE deals SET etapa=?, updated_at=datetime('now') WHERE id=?`).run(etapa, dealId);
+        logEvent("deal_stage_changed", "deal", dealId, { etapa });
+        await tgSendMessage(chatId, `✅ Venda #${dealId} atualizada para: <b>${etapa}</b>`);
+        return res.sendStatus(200);
+      }
 
-        if (!pedidos.length) {
-          await tgSendMessage(chatId, "Nenhum pedido encontrado.");
-        } else {
-          let texto = "📋 Últimos Pedidos:\n\n";
-          pedidos.forEach((p) => {
-            texto += `#${p.id} - ${p.nome} - R$${p.valor}\nStatus: ${p.status_producao}\n\n`;
-          });
-          await tgSendMessage(chatId, texto);
+      if (data.startsWith("D:TO_ORDER:")) {
+        // converte venda em pedido
+        const dealId = Number(data.split(":")[2]);
+        const d = db.prepare(`SELECT * FROM deals WHERE id=?`).get(dealId);
+        if (!d) { await tgSendMessage(chatId, "Venda não encontrada."); return res.sendStatus(200); }
+
+        // cria pedido com dados
+        const r = db.prepare(`
+          INSERT INTO orders (nome, contato, endereco, descricao, observacoes, valor)
+          VALUES (?,?,?,?,?,?)
+        `).run(
+          d.nome,
+          d.contato,
+          d.endereco,
+          d.descricao,
+          d.observacoes,
+          d.valor_estimado || 0
+        );
+
+        db.prepare(`UPDATE deals SET etapa='Concluída', updated_at=datetime('now') WHERE id=?`).run(dealId);
+        logEvent("deal_converted_to_order", "deal", dealId, { order_id: r.lastInsertRowid });
+        await tgSendMessage(chatId, `✅ Venda #${dealId} convertida em Pedido #${r.lastInsertRowid}.`);
+        return res.sendStatus(200);
+      }
+
+      // -------- PEDIDOS --------
+      if (data === "O:NEW") {
+        setState(chatId, "ORDER_WIZ", "nome", {});
+        await tgSendMessage(chatId, "📦 <b>Novo Pedido</b>\nDigite o <b>NOME</b> do cliente:");
+        return res.sendStatus(200);
+      }
+
+      if (data === "O:LIST20") {
+        await tgSendMessage(chatId, listOrders(20));
+        return res.sendStatus(200);
+      }
+
+      if (data === "O:SEARCH") {
+        setState(chatId, "SEARCH", "order", { last: "order" });
+        await tgSendMessage(chatId, "🔎 Digite: <b>ID</b> ou <b>nome</b> ou <b>contato</b> para buscar pedido:");
+        return res.sendStatus(200);
+      }
+
+      if (data === "O:SETSTATUS") {
+        setState(chatId, "SET_STATUS", "ask_id", {});
+        await tgSendMessage(chatId, "🏷️ Digite o <b>ID do pedido</b> que você quer mudar o status de produção:");
+        return res.sendStatus(200);
+      }
+
+      if (data.startsWith("ST:")) {
+        const st = data.slice(3);
+        const stt = getState(chatId);
+        if (stt.mode !== "SET_STATUS" || !stt.payload?.order_id) {
+          await tgSendMessage(chatId, "Sem pedido selecionado para status.");
+          return res.sendStatus(200);
         }
+        const orderId = Number(stt.payload.order_id);
+        db.prepare(`UPDATE orders SET status_producao=? WHERE id=?`).run(st, orderId);
+        logEvent("order_status_changed", "order", orderId, { status: st });
+        clearState(chatId);
+        await tgSendMessage(chatId, `✅ Pedido #${orderId} status atualizado para: <b>${st}</b>`);
+        return res.sendStatus(200);
+      }
+
+      // -------- PRODUÇÃO --------
+      if (data.startsWith("P:LIST:")) {
+        const code = data.split(":")[2];
+        const map = { A: "Aguardando produção", E: "Em produção", P: "Pronto", T: "Entregue", X: "Problema" };
+        await tgSendMessage(chatId, listOrdersByProdStatus(map[code]));
+        return res.sendStatus(200);
+      }
+
+      if (data === "P:LATE") {
+        await tgSendMessage(chatId, listLateOrders());
+        return res.sendStatus(200);
+      }
+
+      // -------- AGENDA --------
+      if (data === "A:PICKUP:TODAY") { await tgSendMessage(chatId, listAgendaPickupToday()); return res.sendStatus(200); }
+      if (data === "A:DELIV:TODAY") { await tgSendMessage(chatId, listAgendaDeliveryToday()); return res.sendStatus(200); }
+      if (data === "A:DELIV:WEEK") { await tgSendMessage(chatId, listAgendaDeliveryWeek()); return res.sendStatus(200); }
+      if (data === "A:LATE") { await tgSendMessage(chatId, listLateOrders()); return res.sendStatus(200); }
+
+      // -------- FINANCEIRO --------
+      if (data === "F:PAY") {
+        setState(chatId, "PAY_WIZ", "order_id", {});
+        await tgSendMessage(chatId, "💵 Digite o <b>ID do pedido</b> para registrar pagamento:");
+        return res.sendStatus(200);
+      }
+
+      if (data.startsWith("F:LIST:")) {
+        const type = data.split(":")[2];
+        await tgSendMessage(chatId, listFinanceByType(type));
+        return res.sendStatus(200);
+      }
+
+      if (data === "F:CASH:TODAY") {
+        const c = cashToday();
+        await tgSendMessage(chatId, `📊 <b>Caixa do Dia</b> (${c.date})\nPagamentos: ${c.count}\nTotal: <b>${moneyBR(c.sum)}</b>`);
+        return res.sendStatus(200);
+      }
+
+      if (data === "F:CLOSE:DAY") {
+        const c = cashToday();
+        logEvent("cash_close_day", "finance", c.date, c);
+        await tgSendMessage(chatId, `✅ <b>Dia fechado</b> (${c.date})\nTotal: <b>${moneyBR(c.sum)}</b>\nPagamentos: ${c.count}`);
+        return res.sendStatus(200);
+      }
+
+      if (data.startsWith("PM:")) {
+        const method = data.slice(3);
+        const stt = getState(chatId);
+        if (stt.mode !== "PAY_WIZ") {
+          await tgSendMessage(chatId, "Fluxo de pagamento não ativo.");
+          return res.sendStatus(200);
+        }
+        stt.payload = stt.payload || {};
+        stt.payload.metodo = method;
+        setState(chatId, "PAY_WIZ", "valor", stt.payload);
+        await tgSendMessage(chatId, `Método: <b>${method}</b>\nAgora digite o <b>valor pago</b> (ex: 500 ou 500,00):`);
+        return res.sendStatus(200);
+      }
+
+      // -------- IA --------
+      if (data === "AI:CHAT") {
+        setState(chatId, "AI_CHAT", "", { previous_response_id: null });
+        await tgSendMessage(chatId, "🤖 <b>Chat IA ativado</b>\n\nFale comigo aqui.\nPara sair: clique em <b>Sair do Chat IA</b>.", KB_AI_CHAT());
+        return res.sendStatus(200);
+      }
+
+      if (data === "AI:EXIT") {
+        clearState(chatId);
+        await showMainMenu(chatId);
+        return res.sendStatus(200);
+      }
+
+      if (data === "AI:RESET") {
+        setState(chatId, "AI_CHAT", "", { previous_response_id: null });
+        await tgSendMessage(chatId, "🧹 Conversa da IA resetada. Pode falar de novo.", KB_AI_CHAT());
+        return res.sendStatus(200);
+      }
+
+      if (data === "AI:ALERTS") {
+        const ctx = buildContextSummary();
+        let txt = `⚠️ <b>Alertas do Dia</b> (${ctx.kpis.date})\n\n`;
+        txt += `• Atrasados: <b>${ctx.kpis.atrasados}</b>\n`;
+        txt += `• Caixa hoje: <b>${moneyBR(ctx.kpis.caixaHoje)}</b>\n`;
+        txt += `• Pedidos hoje: <b>${ctx.kpis.pedidosHoje}</b>\n\n`;
+
+        if (ctx.late_orders.length) {
+          txt += `<b>Top atrasados:</b>\n`;
+          for (const o of ctx.late_orders) {
+            txt += `#${o.id} ${o.nome || "Sem nome"} — entrega ${o.data_entregar} (${o.status_producao})\n`;
+          }
+        } else {
+          txt += "✅ Sem atrasos no momento.\n";
+        }
+        await tgSendMessage(chatId, txt);
+        return res.sendStatus(200);
+      }
+
+      if (data === "AI:INSIGHTS") {
+        // Gera insights via IA + salva no banco
+        const ctx = buildContextSummary();
+        const prompt =
+          `Você é o diretor administrativo e estrategista de uma empresa sob encomenda (Make-to-Order). ` +
+          `Analise os dados abaixo e gere: (1) alertas financeiros, (2) gargalos de produção, (3) sugestões de vendas e cobrança, ` +
+          `(4) priorização de agenda. Seja direto e prático.\n\nDADOS(JSON):\n${JSON.stringify(ctx, null, 2)}`;
+
+        const stt = getState(chatId);
+        const prev = stt.mode === "AI_CHAT" ? stt.payload?.previous_response_id : null;
+        const ans = await openaiAsk({ input: prompt, previous_response_id: prev });
+
+        const out = ans.ok ? ans.text : ans.text;
+        db.prepare(`INSERT INTO insights(scope, insight_text) VALUES(?,?)`).run("daily", out);
+        logEvent("ai_insights_generated", "ai", "daily", { date: ctx.kpis.date });
+
+        await tgSendMessage(chatId, `🧠 <b>Insights IA</b>\n\n${out}`);
+        return res.sendStatus(200);
+      }
+
+      // -------- SISTEMA --------
+      if (data === "S:DB") {
+        const k = kpis();
+        await tgSendMessage(
+          chatId,
+          `📌 <b>Status do DB</b>\n\nArquivo: <code>${dbPath}</code>\nPedidos hoje: ${k.pedidosHoje}\nVendas concluídas hoje: ${k.vendasHoje}\nCaixa hoje: ${moneyBR(k.caixaHoje)}\nAtrasados: ${k.atrasados}`
+        );
+        return res.sendStatus(200);
+      }
+
+      if (data === "S:WA") {
+        const has = !!WA_VERIFY_TOKEN;
+        await tgSendMessage(
+          chatId,
+          `📲 <b>Status WhatsApp</b>\nWebhook: <code>/wa/webhook</code>\nVerify token configurado: <b>${has ? "SIM" : "NÃO"}</b>\n\nSe no navegador aparecer "Cannot GET /wa/webhook" então o deploy não atualizou.`
+        );
+        return res.sendStatus(200);
       }
 
       return res.sendStatus(200);
     }
 
-    // ================= MENSAGENS =================
+    // ---------- MESSAGES ----------
     if (body.message) {
       const msg = body.message;
       const chatId = msg.chat.id;
       const userId = msg.from.id;
       const text = (msg.text || "").trim();
 
-      if (userId !== ADMIN_ID) return res.sendStatus(200);
+      if (!isAdmin(userId)) return res.sendStatus(200);
 
-      // 🔥 PRIORIDADE ABSOLUTA PARA COMANDOS (CORREÇÃO DO SEU ERRO)
+      // comandos sempre têm prioridade
       if (text === "/start" || text === "/menu" || text.toLowerCase() === "menu") {
-        clearWizard(chatId);
-        await tgSendMessage(chatId, "📊 Painel Administrativo", {
-          reply_markup: menuKeyboard(),
-        });
+        clearState(chatId);
+        await showMainMenu(chatId);
         return res.sendStatus(200);
       }
 
-      // ================= WIZARD FLOW =================
-      const wizard = getWizard(chatId);
+      // modo atual
+      const stt = getState(chatId);
 
-      if (wizard) {
-        const data = wizard.data;
+      // ====== MODO CHAT IA ======
+      if (stt.mode === "AI_CHAT") {
+        const ctx = buildContextSummary();
+        const prompt =
+          `Você é um diretor administrativo e vendedor estratégico. ` +
+          `Responda ao dono com clareza, propondo alertas e ações. ` +
+          `Use os dados do contexto para embasar.\n\nCONTEXTO(JSON):\n${JSON.stringify(ctx, null, 2)}\n\nMENSAGEM DO DONO:\n${text}`;
 
-        if (wizard.step === "nome") {
+        const ans = await openaiAsk({
+          input: prompt,
+          previous_response_id: stt.payload?.previous_response_id || null,
+        });
+
+        if (ans.ok) {
+          stt.payload.previous_response_id = ans.previous_response_id;
+          setState(chatId, "AI_CHAT", "", stt.payload);
+          await tgSendMessage(chatId, ans.text, KB_AI_CHAT());
+        } else {
+          await tgSendMessage(chatId, ans.text, KB_AI_CHAT());
+        }
+        return res.sendStatus(200);
+      }
+
+      // ====== SEARCH ======
+      if (stt.mode === "SEARCH") {
+        const kind = stt.step; // 'order' ou 'deal'
+        const q = text;
+
+        const isId = /^\d+$/.test(q);
+        if (kind === "order") {
+          let rows = [];
+          if (isId) {
+            const o = db.prepare(`SELECT * FROM orders WHERE id=?`).get(Number(q));
+            rows = o ? [o] : [];
+          } else {
+            rows = db.prepare(`
+              SELECT * FROM orders
+              WHERE nome LIKE ? OR contato LIKE ?
+              ORDER BY id DESC
+              LIMIT 20
+            `).all(`%${q}%`, `%${q}%`);
+          }
+
+          if (!rows.length) {
+            await tgSendMessage(chatId, "Nenhum pedido encontrado.");
+          } else {
+            let txt = `🔎 <b>Resultados (Pedidos)</b>\n\n`;
+            for (const p of rows) {
+              const f = orderFinancial(p.id);
+              const fin = f ? ` | ${f.status} (${moneyBR(f.paid)}/${moneyBR(f.total)})` : "";
+              txt += `#${p.id} - ${p.nome || "Sem nome"} - ${moneyBR(p.valor)}\nProd: ${p.status_producao}${fin}\n\n`;
+            }
+            await tgSendMessage(chatId, txt);
+          }
+        } else {
+          let rows = [];
+          if (isId) {
+            const d = db.prepare(`SELECT * FROM deals WHERE id=?`).get(Number(q));
+            rows = d ? [d] : [];
+          } else {
+            rows = db.prepare(`
+              SELECT * FROM deals
+              WHERE nome LIKE ? OR contato LIKE ? OR wa_id LIKE ?
+              ORDER BY updated_at DESC
+              LIMIT 20
+            `).all(`%${q}%`, `%${q}%`, `%${q}%`);
+          }
+
+          if (!rows.length) {
+            await tgSendMessage(chatId, "Nenhuma venda encontrada.");
+          } else {
+            let txt = `🔎 <b>Resultados (Vendas)</b>\n\n`;
+            for (const d of rows) {
+              txt += `#${d.id} - ${d.nome || "Sem nome"} (${d.contato || "-"})\n`;
+              txt += `Etapa: <b>${d.etapa}</b> | Origem: ${d.origem}\n`;
+              if (d.valor_estimado != null) txt += `Valor: ${moneyBR(d.valor_estimado)}\n`;
+
+              // botões rápidos por venda
+              txt += `\n`;
+              await tgSendMessage(chatId, txt, kb([
+                [{ text: "🟡 Negociação", callback_data: `D:SET:${d.id}:Negociação` }, { text: "📨 Orçamento enviado", callback_data: `D:SET:${d.id}:Orçamento enviado` }],
+                [{ text: "🟢 Concluir", callback_data: `D:SET:${d.id}:Concluída` }, { text: "🔴 Perder", callback_data: `D:SET:${d.id}:Perdida` }],
+                [{ text: "➡️ Converter em Pedido", callback_data: `D:TO_ORDER:${d.id}` }],
+              ]));
+              txt = "";
+            }
+          }
+        }
+
+        clearState(chatId);
+        return res.sendStatus(200);
+      }
+
+      // ====== SET STATUS FLOW ======
+      if (stt.mode === "SET_STATUS" && stt.step === "ask_id") {
+        const id = Number(text);
+        if (!id) {
+          await tgSendMessage(chatId, "ID inválido. Digite apenas número.");
+          return res.sendStatus(200);
+        }
+        const o = db.prepare(`SELECT id, nome, status_producao FROM orders WHERE id=?`).get(id);
+        if (!o) {
+          await tgSendMessage(chatId, "Pedido não encontrado.");
+          return res.sendStatus(200);
+        }
+        setState(chatId, "SET_STATUS", "choose", { order_id: id });
+        await tgSendMessage(chatId, `Pedido #${id} (${o.nome || "Sem nome"})\nStatus atual: <b>${o.status_producao}</b>\n\nEscolha o novo status:`, KB_STATUS());
+        return res.sendStatus(200);
+      }
+
+      // ====== PAY FLOW ======
+      if (stt.mode === "PAY_WIZ") {
+        const payload = stt.payload || {};
+        if (stt.step === "order_id") {
+          const id = Number(text);
+          if (!id) { await tgSendMessage(chatId, "ID inválido."); return res.sendStatus(200); }
+          const o = db.prepare(`SELECT id, nome, valor FROM orders WHERE id=?`).get(id);
+          if (!o) { await tgSendMessage(chatId, "Pedido não encontrado."); return res.sendStatus(200); }
+          payload.order_id = id;
+          setState(chatId, "PAY_WIZ", "method", payload);
+          await tgSendMessage(chatId, `Pedido #${id} (${o.nome || "Sem nome"})\nTotal: <b>${moneyBR(o.valor)}</b>\n\nEscolha o método:`, KB_PAY_METHOD());
+          return res.sendStatus(200);
+        }
+
+        if (stt.step === "valor") {
+          const v = Number(text.replace(",", "."));
+          if (!v || v <= 0) { await tgSendMessage(chatId, "Valor inválido."); return res.sendStatus(200); }
+
+          const orderId = Number(payload.order_id);
+          const metodo = payload.metodo || "N/A";
+
+          db.prepare(`INSERT INTO payments(order_id, valor, metodo, observacao) VALUES(?,?,?,?)`)
+            .run(orderId, v, metodo, payload.observacao || null);
+
+          logEvent("payment_added", "order", orderId, { valor: v, metodo });
+          const f = orderFinancial(orderId);
+
+          clearState(chatId);
+          await tgSendMessage(chatId, `✅ Pagamento registrado.\nPedido #${orderId}\nMétodo: ${metodo}\nPago: ${moneyBR(f.paid)} / ${moneyBR(f.total)}\nStatus: <b>${f.status}</b>`);
+          return res.sendStatus(200);
+        }
+
+        // se chegou aqui e ainda está em method, ignora texto
+        await tgSendMessage(chatId, "Use os botões para escolher o método.");
+        return res.sendStatus(200);
+      }
+
+      // ====== DEAL WIZARD ======
+      if (stt.mode === "DEAL_WIZ") {
+        const data = stt.payload || {};
+        if (stt.step === "nome") {
           data.nome = text;
-          setWizard(chatId, "contato", data);
-          await tgSendMessage(chatId, "Digite o CONTATO:");
+          setState(chatId, "DEAL_WIZ", "contato", data);
+          await tgSendMessage(chatId, "Digite o <b>CONTATO</b> (telefone):");
           return res.sendStatus(200);
         }
-
-        if (wizard.step === "contato") {
+        if (stt.step === "contato") {
           data.contato = text;
-          setWizard(chatId, "endereco", data);
-          await tgSendMessage(chatId, "Digite o ENDEREÇO:");
+          setState(chatId, "DEAL_WIZ", "endereco", data);
+          await tgSendMessage(chatId, "Digite o <b>ENDEREÇO</b> (ou '-' se não tiver):");
           return res.sendStatus(200);
         }
-
-        if (wizard.step === "endereco") {
-          data.endereco = text;
-          setWizard(chatId, "descricao", data);
-          await tgSendMessage(chatId, "Digite a DESCRIÇÃO do pedido:");
+        if (stt.step === "endereco") {
+          data.endereco = text === "-" ? null : text;
+          setState(chatId, "DEAL_WIZ", "descricao", data);
+          await tgSendMessage(chatId, "Digite a <b>DESCRIÇÃO</b> / pedido do cliente:");
           return res.sendStatus(200);
         }
-
-        if (wizard.step === "descricao") {
+        if (stt.step === "descricao") {
           data.descricao = text;
-          setWizard(chatId, "valor", data);
-          await tgSendMessage(chatId, "Digite o VALOR:");
+          setState(chatId, "DEAL_WIZ", "valor", data);
+          await tgSendMessage(chatId, "Digite o <b>VALOR ESTIMADO</b> (ou 0 se não souber):");
           return res.sendStatus(200);
         }
+        if (stt.step === "valor") {
+          data.valor_estimado = Number(text.replace(",", ".")) || 0;
+          setState(chatId, "DEAL_WIZ", "obs", data);
+          await tgSendMessage(chatId, "Digite <b>OBSERVAÇÕES</b> (ou '-' para pular):");
+          return res.sendStatus(200);
+        }
+        if (stt.step === "obs") {
+          data.observacoes = text === "-" ? null : text;
 
-        if (wizard.step === "valor") {
-          data.valor = parseFloat(text.replace(",", "."));
-          db.prepare(`
-            INSERT INTO orders (nome, contato, endereco, descricao, valor)
-            VALUES (?, ?, ?, ?, ?)
+          const r = db.prepare(`
+            INSERT INTO deals(nome, contato, endereco, descricao, observacoes, valor_estimado, etapa, origem, updated_at)
+            VALUES(?,?,?,?,?,?, 'Lead novo', 'manual', datetime('now'))
           `).run(
             data.nome,
             data.contato,
             data.endereco,
             data.descricao,
-            data.valor
+            data.observacoes,
+            data.valor_estimado
           );
 
-          clearWizard(chatId);
-          await tgSendMessage(chatId, "✅ Pedido criado com sucesso!");
+          logEvent("deal_created", "deal", r.lastInsertRowid, data);
+
+          clearState(chatId);
+
+          await tgSendMessage(
+            chatId,
+            `✅ Venda criada!\n<b>Lead #${r.lastInsertRowid}</b>\nEtapa: <b>Lead novo</b>\n\nQuer marcar etapa agora?`,
+            kb([
+              [{ text: "📨 Orçamento enviado", callback_data: `D:SET:${r.lastInsertRowid}:Orçamento enviado` }],
+              [{ text: "🟡 Negociação", callback_data: `D:SET:${r.lastInsertRowid}:Negociação` }],
+              [{ text: "➡️ Converter em Pedido", callback_data: `D:TO_ORDER:${r.lastInsertRowid}` }],
+              [{ text: "⬅️ Voltar", callback_data: "M:MAIN" }],
+            ])
+          );
           return res.sendStatus(200);
         }
       }
 
-      // 🚫 NÃO SALVA MAIS “/menu” COMO NOTA
+      // ====== ORDER WIZARD (completo) ======
+      if (stt.mode === "ORDER_WIZ") {
+        const data = stt.payload || {};
+
+        if (stt.step === "nome") {
+          data.nome = text;
+          setState(chatId, "ORDER_WIZ", "contato", data);
+          await tgSendMessage(chatId, "Digite o <b>CONTATO</b>:");
+          return res.sendStatus(200);
+        }
+        if (stt.step === "contato") {
+          data.contato = text;
+          setState(chatId, "ORDER_WIZ", "endereco", data);
+          await tgSendMessage(chatId, "Digite o <b>ENDEREÇO</b>:");
+          return res.sendStatus(200);
+        }
+        if (stt.step === "endereco") {
+          data.endereco = text;
+          setState(chatId, "ORDER_WIZ", "descricao", data);
+          await tgSendMessage(chatId, "Digite a <b>DESCRIÇÃO</b> do pedido:");
+          return res.sendStatus(200);
+        }
+        if (stt.step === "descricao") {
+          data.descricao = text;
+          setState(chatId, "ORDER_WIZ", "obs", data);
+          await tgSendMessage(chatId, "Digite <b>OBSERVAÇÕES</b> (ou '-' para pular):");
+          return res.sendStatus(200);
+        }
+        if (stt.step === "obs") {
+          data.observacoes = text === "-" ? null : text;
+          setState(chatId, "ORDER_WIZ", "valor", data);
+          await tgSendMessage(chatId, "Digite o <b>VALOR</b> (ex: 1700 ou 1700,00):");
+          return res.sendStatus(200);
+        }
+        if (stt.step === "valor") {
+          const v = Number(text.replace(",", "."));
+          if (!v || v <= 0) { await tgSendMessage(chatId, "Valor inválido."); return res.sendStatus(200); }
+          data.valor = v;
+          setState(chatId, "ORDER_WIZ", "data_buscar", data);
+          await tgSendMessage(chatId, "Digite a <b>DATA DE BUSCAR</b> (DD/MM/AAAA ou YYYY-MM-DD) ou '-' para pular:");
+          return res.sendStatus(200);
+        }
+        if (stt.step === "data_buscar") {
+          if (text === "-") data.data_buscar = null;
+          else {
+            const iso = parseDateToISO(text);
+            if (!iso) { await tgSendMessage(chatId, "Data inválida. Use DD/MM/AAAA."); return res.sendStatus(200); }
+            data.data_buscar = iso;
+          }
+          setState(chatId, "ORDER_WIZ", "data_entregar", data);
+          await tgSendMessage(chatId, "Digite a <b>DATA DE ENTREGAR</b> (DD/MM/AAAA ou YYYY-MM-DD) ou '-' para pular:");
+          return res.sendStatus(200);
+        }
+        if (stt.step === "data_entregar") {
+          if (text === "-") data.data_entregar = null;
+          else {
+            const iso = parseDateToISO(text);
+            if (!iso) { await tgSendMessage(chatId, "Data inválida. Use DD/MM/AAAA."); return res.sendStatus(200); }
+            data.data_entregar = iso;
+          }
+
+          // confirma
+          setState(chatId, "ORDER_WIZ", "confirm", data);
+          const preview =
+            `🧾 <b>Confirme o Pedido</b>\n\n` +
+            `Cliente: <b>${data.nome}</b>\n` +
+            `Contato: ${data.contato}\n` +
+            `Endereço: ${data.endereco}\n` +
+            `Descrição: ${data.descricao}\n` +
+            `Obs: ${data.observacoes || "-"}\n` +
+            `Valor: <b>${moneyBR(data.valor)}</b>\n` +
+            `Buscar: ${data.data_buscar || "-"}\n` +
+            `Entregar: ${data.data_entregar || "-"}\n\n` +
+            `Salvar?`;
+
+          await tgSendMessage(chatId, preview, KB_CONFIRM("O:CONFIRM:YES", "O:CONFIRM:NO"));
+          return res.sendStatus(200);
+        }
+        if (stt.step === "confirm") {
+          // aqui só via callback (O:CONFIRM)
+          await tgSendMessage(chatId, "Use os botões ✅ SIM / ❌ NÃO.");
+          return res.sendStatus(200);
+        }
+      }
+
+      // fallback
       await tgSendMessage(chatId, "Use /menu para abrir o painel.");
       return res.sendStatus(200);
     }
 
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (err) {
-    console.error("ERRO:", err);
-    res.sendStatus(200);
+    console.error("ERRO webhook:", err);
+    return res.sendStatus(200);
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("Bot ERP rodando");
-});
+// Confirmar pedido via callback (fechamos aqui para manter acima limpo)
+app.post("/webhook", (req, res) => res.sendStatus(200)); // placeholder (evita duplicidade, não usar)
 
+// ⚠️ Re-registrar o handler do Telegram corretamente (sem duplicar)
+// Como acima já definimos /webhook, este bloco é apenas para evitar confusão caso alguém copie/cole.
+// REMOVA este placeholder se você já tem o /webhook acima (o seu arquivo final deve ter APENAS UM app.post("/webhook") ).
+
+// ===================== ROOT =====================
+app.get("/", (req, res) => res.send("Bot ERP rodando"));
+
+// ===================== START =====================
 app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
   console.log("Banco:", dbPath);
+  console.log("Telegram webhook: POST /webhook");
+  console.log("WhatsApp webhook: GET/POST /wa/webhook");
 });
-

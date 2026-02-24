@@ -379,6 +379,21 @@ function KB_AI_CHAT() {
 }
 
 // ===================== OPENAI (IA) =====================
+// ✅ CORREÇÃO: parse robusto do texto (evita "Sem resposta." quando output_text não vem)
+function extractResponseText(data) {
+  if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+
+  const out0 = data?.output?.[0];
+  const content = out0?.content || [];
+  for (const c of content) {
+    if (c?.type === "output_text" && typeof c?.text === "string" && c.text.trim()) return c.text.trim();
+    if (c?.type === "text" && typeof c?.text === "string" && c.text.trim()) return c.text.trim();
+  }
+
+  if (typeof data?.output === "string" && data.output.trim()) return data.output.trim();
+  return "";
+}
+
 async function openaiAsk({ input, previous_response_id }) {
   if (!OPENAI_API_KEY) {
     return { ok: false, text: "IA não configurada. Coloque OPENAI_API_KEY no Render.", previous_response_id: null };
@@ -399,10 +414,11 @@ async function openaiAsk({ input, previous_response_id }) {
 
   const data = await res.json().catch(() => ({}));
   if (!data || data.error) {
+    console.error("OpenAI error payload:", data);
     return { ok: false, text: `Erro IA: ${data?.error?.message || "falha na API"}`, previous_response_id: null };
   }
 
-  const text = typeof data.output_text === "string" ? data.output_text : "";
+  const text = extractResponseText(data);
   return { ok: true, text: text || "Sem resposta.", previous_response_id: data.id || previous_response_id || null };
 }
 
@@ -444,7 +460,6 @@ function buildContextSummary() {
 }
 
 // ===================== WHATSAPP WEBHOOK =====================
-// Verificação (Meta chama GET para validar)
 app.get("/wa/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -460,7 +475,6 @@ app.get("/wa/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// Receber mensagens (captura lead + salva no banco + notifica Telegram)
 app.post("/wa/webhook", async (req, res) => {
   res.sendStatus(200);
 
@@ -475,24 +489,19 @@ app.post("/wa/webhook", async (req, res) => {
     if (!messages?.length) return;
 
     for (const m of messages) {
-      const wa_id = m.from; // telefone do cliente
+      const wa_id = m.from;
       const text = m.text?.body || "[Mensagem não textual]";
 
       saveMessage({ channel: "whatsapp", wa_id, direction: "in", text, raw: body });
 
-      // upsert deal (lead) automaticamente
       const existing = db.prepare(`SELECT id FROM deals WHERE wa_id=? ORDER BY id DESC LIMIT 1`).get(wa_id);
       let dealId = existing?.id;
 
       if (!dealId) {
-        const r = db
-          .prepare(
-            `
+        const r = db.prepare(`
           INSERT INTO deals(nome, contato, endereco, descricao, observacoes, valor_estimado, etapa, origem, wa_id, updated_at)
           VALUES(?,?,?,?,?,?,?,?,?, datetime('now'))
-        `
-          )
-          .run(null, wa_id, null, text, null, null, "Lead novo", "whatsapp", wa_id);
+        `).run(null, wa_id, null, text, null, null, "Lead novo", "whatsapp", wa_id);
         dealId = r.lastInsertRowid;
         logEvent("wa_lead_created", "deal", dealId, { wa_id, first_message: text });
       } else {
@@ -500,7 +509,6 @@ app.post("/wa/webhook", async (req, res) => {
         logEvent("wa_message_in", "deal", dealId, { wa_id, text });
       }
 
-      // Notifica no Telegram (painel)
       await tgSendMessage(
         ADMIN_ID,
         `📲 <b>Novo WhatsApp</b>\n<b>Lead #${dealId}</b>\nDe: <b>${wa_id}</b>\nMsg: ${text}\n\nUse /menu → 💰 Vendas (CRM) para gerenciar.`
@@ -529,17 +537,13 @@ function listDealsByType(type) {
   if (type === "DONE") where = `etapa='Concluída'`;
   if (type === "LOST") where = `etapa='Perdida'`;
 
-  const rows = db
-    .prepare(
-      `
+  const rows = db.prepare(`
     SELECT id, nome, contato, valor_estimado, etapa, origem, updated_at
     FROM deals
     WHERE ${where}
     ORDER BY updated_at DESC
     LIMIT 20
-  `
-    )
-    .all();
+  `).all();
 
   if (!rows.length) return "Nenhuma venda encontrada.";
 
@@ -570,17 +574,13 @@ function listOrders(limit = 20) {
 }
 
 function listOrdersByProdStatus(status) {
-  const rows = db
-    .prepare(
-      `
+  const rows = db.prepare(`
     SELECT id, nome, valor, data_entregar, status_producao
     FROM orders
     WHERE status_producao=?
     ORDER BY COALESCE(data_entregar,'9999-12-31') ASC, id DESC
     LIMIT 30
-  `
-    )
-    .all(status);
+  `).all(status);
 
   if (!rows.length) return `Nenhum pedido em: ${status}`;
 
@@ -595,17 +595,13 @@ function listOrdersByProdStatus(status) {
 
 function listLateOrders() {
   const t = todayISO();
-  const rows = db
-    .prepare(
-      `
+  const rows = db.prepare(`
     SELECT id, nome, valor, data_entregar, status_producao
     FROM orders
     WHERE data_entregar IS NOT NULL AND data_entregar < ? AND status_producao != 'Entregue'
     ORDER BY data_entregar ASC
     LIMIT 30
-  `
-    )
-    .all(t);
+  `).all(t);
 
   if (!rows.length) return "✅ Nenhum pedido atrasado.";
 
@@ -619,17 +615,13 @@ function listLateOrders() {
 
 function listAgendaPickupToday() {
   const t = todayISO();
-  const rows = db
-    .prepare(
-      `
+  const rows = db.prepare(`
     SELECT id, nome, contato, endereco, data_buscar, status_producao
     FROM orders
     WHERE data_buscar = ?
     ORDER BY id DESC
     LIMIT 30
-  `
-    )
-    .all(t);
+  `).all(t);
 
   if (!rows.length) return "Nenhuma busca para hoje.";
 
@@ -644,17 +636,13 @@ function listAgendaPickupToday() {
 
 function listAgendaDeliveryToday() {
   const t = todayISO();
-  const rows = db
-    .prepare(
-      `
+  const rows = db.prepare(`
     SELECT id, nome, contato, endereco, data_entregar, status_producao
     FROM orders
     WHERE data_entregar = ?
     ORDER BY id DESC
     LIMIT 30
-  `
-    )
-    .all(t);
+  `).all(t);
 
   if (!rows.length) return "Nenhuma entrega para hoje.";
 
@@ -669,9 +657,7 @@ function listAgendaDeliveryToday() {
 
 function listAgendaDeliveryWeek() {
   const t = todayISO();
-  const rows = db
-    .prepare(
-      `
+  const rows = db.prepare(`
     SELECT id, nome, valor, data_entregar, status_producao
     FROM orders
     WHERE data_entregar IS NOT NULL
@@ -680,9 +666,7 @@ function listAgendaDeliveryWeek() {
       AND status_producao != 'Entregue'
     ORDER BY data_entregar ASC
     LIMIT 50
-  `
-    )
-    .all(t, t);
+  `).all(t, t);
 
   if (!rows.length) return "Nenhuma entrega nos próximos 7 dias.";
 
@@ -793,7 +777,6 @@ app.post("/webhook", async (req, res) => {
       }
 
       if (data.startsWith("D:SET:")) {
-        // D:SET:<dealId>:<etapa>
         const parts = data.split(":");
         const dealId = Number(parts[2]);
         const etapa = parts.slice(3).join(":");
@@ -804,7 +787,6 @@ app.post("/webhook", async (req, res) => {
       }
 
       if (data.startsWith("D:TO_ORDER:")) {
-        // converte venda em pedido
         const dealId = Number(data.split(":")[2]);
         const d = db.prepare(`SELECT * FROM deals WHERE id=?`).get(dealId);
         if (!d) {
@@ -812,14 +794,10 @@ app.post("/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        const r = db
-          .prepare(
-            `
+        const r = db.prepare(`
           INSERT INTO orders (nome, contato, endereco, descricao, observacoes, valor)
           VALUES (?,?,?,?,?,?)
-        `
-          )
-          .run(d.nome, d.contato, d.endereco, d.descricao, d.observacoes, d.valor_estimado || 0);
+        `).run(d.nome, d.contato, d.endereco, d.descricao, d.observacoes, d.valor_estimado || 0);
 
         db.prepare(`UPDATE deals SET etapa='Concluída', updated_at=datetime('now') WHERE id=?`).run(dealId);
         logEvent("deal_converted_to_order", "deal", dealId, { order_id: r.lastInsertRowid });
@@ -866,7 +844,6 @@ app.post("/webhook", async (req, res) => {
         return res.sendStatus(200);
       }
 
-      // ✅ CONFIRMAR PEDIDO (Wizard)
       if (data === "O:CONFIRM:YES" || data === "O:CONFIRM:NO") {
         const stt = getState(chatId);
         if (stt.mode !== "ORDER_WIZ" || stt.step !== "confirm") {
@@ -880,25 +857,20 @@ app.post("/webhook", async (req, res) => {
           return res.sendStatus(200);
         }
 
-        // YES: salva no banco
         const p = stt.payload || {};
-        const r = db
-          .prepare(
-            `
+        const r = db.prepare(`
           INSERT INTO orders (nome, contato, endereco, descricao, observacoes, valor, data_buscar, data_entregar, status_producao)
           VALUES (?,?,?,?,?,?,?,?, 'Aguardando produção')
-        `
-          )
-          .run(
-            p.nome,
-            p.contato,
-            p.endereco,
-            p.descricao,
-            p.observacoes || null,
-            Number(p.valor || 0),
-            p.data_buscar || null,
-            p.data_entregar || null
-          );
+        `).run(
+          p.nome,
+          p.contato,
+          p.endereco,
+          p.descricao,
+          p.observacoes || null,
+          Number(p.valor || 0),
+          p.data_buscar || null,
+          p.data_entregar || null
+        );
 
         logEvent("order_created", "order", r.lastInsertRowid, p);
         clearState(chatId);
@@ -1069,14 +1041,12 @@ app.post("/webhook", async (req, res) => {
 
       if (!isAdmin(userId)) return res.sendStatus(200);
 
-      // comandos sempre têm prioridade
       if (text === "/start" || text === "/menu" || text.toLowerCase() === "menu") {
         clearState(chatId);
         await showMainMenu(chatId);
         return res.sendStatus(200);
       }
 
-      // modo atual
       const stt = getState(chatId);
 
       // ====== MODO CHAT IA ======
@@ -1104,7 +1074,7 @@ app.post("/webhook", async (req, res) => {
 
       // ====== SEARCH ======
       if (stt.mode === "SEARCH") {
-        const kind = stt.step; // 'order' ou 'deal'
+        const kind = stt.step;
         const q = text;
         const isId = /^\d+$/.test(q);
 
@@ -1114,16 +1084,12 @@ app.post("/webhook", async (req, res) => {
             const o = db.prepare(`SELECT * FROM orders WHERE id=?`).get(Number(q));
             rows = o ? [o] : [];
           } else {
-            rows = db
-              .prepare(
-                `
+            rows = db.prepare(`
               SELECT * FROM orders
               WHERE nome LIKE ? OR contato LIKE ?
               ORDER BY id DESC
               LIMIT 20
-            `
-              )
-              .all(`%${q}%`, `%${q}%`);
+            `).all(`%${q}%`, `%${q}%`);
           }
 
           if (!rows.length) {
@@ -1143,16 +1109,12 @@ app.post("/webhook", async (req, res) => {
             const d = db.prepare(`SELECT * FROM deals WHERE id=?`).get(Number(q));
             rows = d ? [d] : [];
           } else {
-            rows = db
-              .prepare(
-                `
+            rows = db.prepare(`
               SELECT * FROM deals
               WHERE nome LIKE ? OR contato LIKE ? OR wa_id LIKE ?
               ORDER BY updated_at DESC
               LIMIT 20
-            `
-              )
-              .all(`%${q}%`, `%${q}%`, `%${q}%`);
+            `).all(`%${q}%`, `%${q}%`, `%${q}%`);
           }
 
           if (!rows.length) {
@@ -1291,14 +1253,10 @@ app.post("/webhook", async (req, res) => {
         if (stt.step === "obs") {
           data.observacoes = text === "-" ? null : text;
 
-          const r = db
-            .prepare(
-              `
+          const r = db.prepare(`
             INSERT INTO deals(nome, contato, endereco, descricao, observacoes, valor_estimado, etapa, origem, updated_at)
             VALUES(?,?,?,?,?,?, 'Lead novo', 'manual', datetime('now'))
-          `
-            )
-            .run(data.nome, data.contato, data.endereco, data.descricao, data.observacoes, data.valor_estimado);
+          `).run(data.nome, data.contato, data.endereco, data.descricao, data.observacoes, data.valor_estimado);
 
           logEvent("deal_created", "deal", r.lastInsertRowid, data);
 
@@ -1412,7 +1370,6 @@ app.post("/webhook", async (req, res) => {
         }
       }
 
-      // fallback
       await tgSendMessage(chatId, "Use /menu para abrir o painel.");
       return res.sendStatus(200);
     }

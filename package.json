@@ -1,24 +1,40 @@
 {
-  "name": "agente-zap",
-  "version": "2.0.0",
-  "description": "ERP Bot Empresarial (Telegram + IA + PostgreSQL)",
-  "main": "index.js",
-  "type": "commonjs",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "dependencies": {
-    "axios": "^1.7.7",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "multer": "^1.4.5-lts.1",
-    "node-cron": "^3.0.3",
-    "pdf-parse": "^1.1.1",
-    "pdfkit": "^0.15.0",
-    "pg": "^8.12.0",
-    "xlsx": "^0.18.5"
-  }
+  "services": [
+    {
+      "type": "web",
+      "name": "agente-zap",
+      "runtime": "node",
+      "plan": "starter",
+      "region": "ohio",
+      "buildCommand": "npm install",
+      "startCommand": "npm start",
+      "healthCheckPath": "/",
+      "envVars": [
+        { "key": "TELEGRAM_BOT_TOKEN", "sync": false },
+        { "key": "TELEGRAM_ADMIN_ID", "sync": false },
+        { "key": "PUBLIC_BASE_URL", "sync": false },
+
+        {
+          "key": "DATABASE_URL",
+          "fromDatabase": { "name": "erpbot", "property": "connectionString" }
+        },
+
+        { "key": "OPENAI_API_KEY", "sync": false },
+        { "key": "OPENAI_MODEL", "value": "gpt-4.1-mini" },
+
+        { "key": "WA_VERIFY_TOKEN", "sync": false },
+        { "key": "WA_TOKEN", "sync": false },
+        { "key": "PHONE_NUMBER_ID", "sync": false }
+      ]
+    }
+  ],
+  "databases": [
+    {
+      "name": "erpbot",
+      "plan": "basic-256mb",
+      "region": "ohio",
+      "databaseName": "erpbot",
+      "user": "erpbot_user"
+    }
+  ]
 }

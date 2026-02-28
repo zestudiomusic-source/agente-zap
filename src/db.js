@@ -1,3 +1,4 @@
+// src/db.js
 const { Pool } = require('pg');
 
 function createLogger(name = 'DB') {
@@ -17,9 +18,8 @@ function makePool() {
   }
 
   // Render Postgres normalmente precisa SSL
-  const ssl = process.env.PGSSLMODE === 'disable'
-    ? false
-    : { rejectUnauthorized: false };
+  const ssl =
+    process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false };
 
   return new Pool({ connectionString: DATABASE_URL, ssl });
 }
@@ -46,7 +46,7 @@ async function transaction(pool, fn) {
 }
 
 async function initSchema(pool) {
-  // Minimal schema for ERP
+  // 1) Cria tabelas (idempotente)
   const ddl = `
   CREATE TABLE IF NOT EXISTS kv_store (
     key TEXT PRIMARY KEY,
@@ -75,19 +75,37 @@ async function initSchema(pool) {
     due_date DATE,
     source_group_key TEXT
   );
-
-  CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at);
-  CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
-  CREATE INDEX IF NOT EXISTS idx_orders_due_date ON orders(due_date);
   `;
 
   await exec(pool, ddl);
+
+  // 2) MIGRAÇÕES: se o banco já existia com schema antigo, adiciona colunas que faltam
+  // (CREATE TABLE IF NOT EXISTS não adiciona colunas novas em tabelas já existentes)
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_name TEXT;`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS contact TEXT;`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS address TEXT;`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS description TEXT;`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS notes TEXT;`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS value_cents BIGINT;`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS due_date DATE;`);
+  await exec(pool, `ALTER TABLE orders ADD COLUMN IF NOT EXISTS source_group_key TEXT;`);
+
+  // 3) Índices (só depois de garantir que as colunas existem)
+  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at);`);
+  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);`);
+  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_orders_due_date ON orders(due_date);`);
+
+  log.info('Schema OK (com migrações).');
 }
 
 async function createDb() {
   const pool = makePool();
+
   // quick ping
   await exec(pool, 'SELECT 1');
+
   await initSchema(pool);
 
   return {

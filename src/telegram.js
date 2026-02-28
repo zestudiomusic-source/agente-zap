@@ -1,479 +1,464 @@
-/**
- * src/telegram.js - Bot do Telegram
- * Versão 2.1 - PostgreSQL (async) + validações de segurança e tratamento robusto de erros
- */
-
+// src/telegram.js
 const TelegramBot = require("node-telegram-bot-api");
-const crypto = require("crypto");
-const fs = require("fs");
-const path = require("path");
-const https = require("https");
-
-const { parseNubankCsvBuffer } = require("./utils_nubank");
-const { runDailyWork } = require("./reports");
+const { askOpenAI } = require("./openai");
 const { createLogger } = require("./logger");
-const { CONFIG_DEFAULTS } = require("./config");
 
-const logger = createLogger('TELEGRAM');
+function parseSaleText(text) {
+  const t = String(text || "").trim();
+  if (!t) return null;
 
-// Constantes de segurança
-const MAX_FILE_SIZE = CONFIG_DEFAULTS.MAX_FILE_SIZE_MB * 1024 * 1024; // 10MB em bytes
-const ALLOWED_MIME_TYPES = [
-  'text/csv',
-  'application/pdf',
-  'application/vnd.ms-excel',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-];
+  const cliente =
+    (t.match(/cliente[:\s]+([^\n,]+)/i)?.[1] ||
+      t.match(/para\s+([^\n,]+)\s+\d/i)?.[1] ||
+      t.match(/p\/\s*([^\n,]+)\s+\d/i)?.[1] ||
+      "").trim();
 
-const FILE_UPLOAD_TIMEOUT = CONFIG_DEFAULTS.FILE_UPLOAD_TIMEOUT_MS;
+  const valorRaw =
+    (t.match(/valor[:\s]*([\d\.\,]+)/i)?.[1] ||
+      t.match(/\b(\d{2,3}(?:[\.\,]\d{3})*(?:[\.\,]\d{2})?)\b/)?.[1] ||
+      "").trim();
 
-// ========================================
-// FUNÇÕES AUXILIARES
-// ========================================
+  const valor = valorRaw
+    ? Math.round(Number(valorRaw.replace(/\./g, "").replace(",", ".")) * 100)
+    : 0;
 
-function nowIso() { 
-  return new Date().toISOString(); 
-}
+  const produto =
+    (t.match(/produto[:\s]+([^\n]+)/i)?.[1] ||
+      t.match(/venda[:\s]+([^\n]+)/i)?.[1] ||
+      t.match(/produção[:\s]+([^\n]+)/i)?.[1] ||
+      "").trim();
 
-function isAdmin(config, msg) { 
-  const userId = Number(msg?.from?.id);
-  const adminId = Number(config.telegram.adminId);
-  return userId === adminId && userId > 0;
-}
+  if (!cliente && !produto && !valor) return null;
 
-function normalizeGroupName(s) { 
-  return String(s || "").trim().toLowerCase(); 
-}
-
-function getGroupNameByChatId(groups, chatId) {
-  for (const [name, g] of Object.entries(groups)) {
-    if (Number(g.chat_id) === Number(chatId)) return name;
-  }
-  return null;
-}
-
-// ========================================
-// MENUS
-// ========================================
-
-function buildMainMenu() {
   return {
-    reply_markup: { 
+    customer_name: cliente || null,
+    description: produto || t,
+    amount_cents: valor || 0,
+    raw_text: t,
+  };
+}
+
+function shouldCallIA(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+
+  // IA funciona em QUALQUER PARTE DO GRUPO:
+  // - "ia: ..."
+  // - "IA: ..."
+  // - "@bot ..." (se o usuário mencionar)
+  // - "/ia ..." (comando)
+  // - "gpt: ..." (atalho)
+  return (
+    /^ia[:\s]/i.test(t) ||
+    /^gpt[:\s]/i.test(t) ||
+    /^\/ia(\s|$)/i.test(t)
+  );
+}
+
+function extractIAQuery(text) {
+  const t = String(text || "").trim();
+  if (!t) return "";
+
+  if (/^\/ia(\s|$)/i.test(t)) return t.replace(/^\/ia\s*/i, "").trim();
+  if (/^ia[:\s]/i.test(t)) return t.replace(/^ia[:\s]*/i, "").trim();
+  if (/^gpt[:\s]/i.test(t)) return t.replace(/^gpt[:\s]*/i, "").trim();
+  return t;
+}
+
+async function getGroups(db) {
+  return (await db.kvGet("groups")) || {};
+}
+
+async function setGroup(db, key, payload) {
+  const groups = (await getGroups(db)) || {};
+  groups[key] = payload;
+  await db.kvSet("groups", groups);
+  return groups;
+}
+
+// envia mensagem respeitando tópico (forum)
+async function send(bot, msg, text, extra = {}) {
+  const opts = { ...extra };
+  if (msg?.message_thread_id) opts.message_thread_id = msg.message_thread_id;
+  return bot.sendMessage(msg.chat.id, text, opts);
+}
+
+function menuForGroupKey(groupKey) {
+  // você pode crescer isso depois (Produção, Financeiro etc.)
+  if (groupKey === "vendas") {
+    return {
       inline_keyboard: [
-        [
-          { text: "💰 Vendas (CRM)", callback_data: "m:crm" }, 
-          { text: "📦 Pedidos", callback_data: "m:orders" }
-        ],
-        [
-          { text: "🏭 Produção", callback_data: "m:prod" }, 
-          { text: "🧾 Financeiro", callback_data: "m:fin" }
-        ],
-        [
-          { text: "🛒 Compras", callback_data: "m:buy" }, 
-          { text: "📊 Relatórios", callback_data: "m:rep" }
-        ],
-        [
-          { text: "🤖 IA", callback_data: "m:ai" }, 
-          { text: "⚙️ Sistema", callback_data: "m:sys" }
-        ],
-      ]
-    }
+        [{ text: "🧾 CRM", callback_data: "menu:vendas:crm" }],
+        [{ text: "➕ Nova venda (atalho)", callback_data: "menu:vendas:nova" }],
+      ],
+    };
+  }
+
+  if (groupKey === "compras") {
+    return {
+      inline_keyboard: [
+        [{ text: "🛒 Lista de compras", callback_data: "menu:compras:lista" }],
+      ],
+    };
+  }
+
+  if (groupKey === "producao") {
+    return {
+      inline_keyboard: [
+        [{ text: "🏭 Fila de produção", callback_data: "menu:producao:fila" }],
+      ],
+    };
+  }
+
+  if (groupKey === "financeiro") {
+    return {
+      inline_keyboard: [
+        [{ text: "💰 Caixa / Pendências", callback_data: "menu:financeiro:caixa" }],
+      ],
+    };
+  }
+
+  if (groupKey === "relatorios") {
+    return {
+      inline_keyboard: [
+        [{ text: "📈 Ver últimos relatórios", callback_data: "menu:relatorios:ultimos" }],
+      ],
+    };
+  }
+
+  if (groupKey === "backups") {
+    return {
+      inline_keyboard: [
+        [{ text: "🗄️ Status de backups", callback_data: "menu:backups:status" }],
+      ],
+    };
+  }
+
+  return {
+    inline_keyboard: [[{ text: "ℹ️ Ajuda", callback_data: "menu:ajuda" }]],
   };
 }
-
-function buildGroupMenu(groupName) {
-  const menus = {
-    producao: [[{ text: "📅 Ordem do Dia", callback_data: "g:prod:today" }]],
-    compras: [[{ text: "🛒 Lista de Compras", callback_data: "g:buy:today" }]],
-    financeiro: [[{ text: "🧾 Enviar Extrato CSV", callback_data: "g:fin:upload" }]],
-    relatorios: [[{ text: "📊 Gerar Relatório IA", callback_data: "g:rep:ai" }]],
-    vendas: [[{ text: "💰 CRM", callback_data: "g:crm:leads" }]],
-    backups: [[{ text: "🗂️ Status dos Backups", callback_data: "g:bkp:info" }]],
-  };
-
-  return { 
-    reply_markup: { 
-      inline_keyboard: menus[groupName] || [] 
-    } 
-  };
-}
-
-// ========================================
-// DOWNLOAD DE ARQUIVOS (com timeout e validação)
-// ========================================
-
-async function downloadTo(localPath, url, maxSize = MAX_FILE_SIZE) {
-  return new Promise((resolve, reject) => {
-    const stream = fs.createWriteStream(localPath);
-    let downloaded = 0;
-
-    const timeout = setTimeout(() => {
-      stream.destroy();
-      try { fs.unlinkSync(localPath); } catch {}
-      reject(new Error('Timeout: download demorou mais que 30 segundos'));
-    }, FILE_UPLOAD_TIMEOUT);
-
-    const request = https.get(url, (res) => {
-      const contentLength = parseInt(res.headers['content-length'] || '0');
-      if (contentLength > maxSize) {
-        clearTimeout(timeout);
-        stream.destroy();
-        try { fs.unlinkSync(localPath); } catch {}
-        reject(new Error(`Arquivo muito grande: ${(contentLength / 1024 / 1024).toFixed(2)}MB (máx: ${MAX_FILE_SIZE / 1024 / 1024}MB)`));
-        return;
-      }
-
-      res.on('data', (chunk) => {
-        downloaded += chunk.length;
-        if (downloaded > maxSize) {
-          clearTimeout(timeout);
-          stream.destroy();
-          try { fs.unlinkSync(localPath); } catch {}
-          reject(new Error('Arquivo excedeu tamanho máximo durante download'));
-        }
-      });
-
-      res.pipe(stream);
-
-      stream.on('finish', () => {
-        clearTimeout(timeout);
-        stream.close(() => resolve(downloaded));
-      });
-    });
-
-    request.on('error', (err) => {
-      clearTimeout(timeout);
-      try { fs.unlinkSync(localPath); } catch {}
-      reject(err);
-    });
-  });
-}
-
-// ========================================
-// CRIAÇÃO DO BOT
-// ========================================
 
 async function createTelegramBot({ config, db }) {
-  if (!config.telegram.botToken) {
-    throw new Error('TELEGRAM_BOT_TOKEN não configurado');
-  }
+  const logger = createLogger("TELEGRAM");
 
-  const useWebhook = !!config.telegram.useWebhook;
+  const botToken = process.env.TELEGRAM_BOT_TOKEN || config?.telegram?.botToken;
+  const adminId = Number(process.env.TELEGRAM_ADMIN_ID || config?.telegram?.adminId || 0);
 
-  // Importante: para Web Service, recomendamos Express receber o webhook.
-  // Aqui, quando useWebhook=true, desativamos polling e NÃO iniciamos servidor interno do node-telegram-bot-api.
-  const bot = new TelegramBot(config.telegram.botToken, { polling: !useWebhook });
+  if (!botToken) throw new Error("TELEGRAM_BOT_TOKEN não configurado!");
+  if (!adminId) throw new Error("TELEGRAM_ADMIN_ID não configurado!");
 
-  // Se useWebhook=true, o server.js vai chamar bot.processUpdate() no endpoint configurado.
+  const useWebhook = !!(process.env.TELEGRAM_USE_WEBHOOK || config?.telegram?.useWebhook);
 
-  // Cria bot
-  // (instância já criada acima)
+  // Para Web Service: polling por padrão (estável e simples)
+  const bot = new TelegramBot(botToken, { polling: !useWebhook });
 
-  //
-  //(config.telegram.botToken, botOptions);
+  const me = await bot.getMe();
+  logger.info(`✅ Bot conectado: @${me.username} (ADM)`);
 
-  // Valida token
-  let botInfo;
-  try {
-    botInfo = await bot.getMe();
-    logger.info(`✅ Bot conectado: @${botInfo.username} (${botInfo.first_name})`);
-    bot.botInfo = botInfo;
-  } catch (err) {
-    throw new Error(`Token inválido ou erro de rede: ${err.message}`);
-  }
-
-  // Configura webhook se necessário
-  if (config.telegram.useWebhook && config.publicBaseUrl) {
-    const webhookUrl = `${config.publicBaseUrl}${config.telegram.webhookPath}`;
-    try {
-      await bot.setWebHook(webhookUrl);
-      logger.info(`✅ Webhook configurado: ${webhookUrl}`);
-    } catch (err) {
-      logger.error('❌ Erro ao configurar webhook:', err.message);
-    }
-  }
-
-  // ========================================
-  // COMANDOS
-  // ========================================
-
+  // =========================
+  // /start
+  // =========================
   bot.onText(/^\/start$/, async (msg) => {
-    try {
-      await bot.sendMessage(
-        msg.chat.id, 
-        "✅ ERP Bot ativo!\n\nUse /menu para abrir o painel de controle.\nUse /id para ver informações do chat."
+    if (msg.from?.id !== adminId) return;
+    await send(
+      bot,
+      msg,
+      "✅ ERP bot ativo!\n\nUse /menu para abrir o painel.\nUse /ia para perguntar algo.\nUse /setgroup <nome> para registrar o grupo."
+    );
+  });
+
+  // =========================
+  // /menu (mostra menu do grupo atual)
+  // =========================
+  bot.onText(/^\/menu$/, async (msg) => {
+    if (msg.from?.id !== adminId) return;
+
+    const groups = await getGroups(db);
+    const chatId = Number(msg.chat.id);
+
+    // acha qual grupo é esse chat_id
+    let groupKey = null;
+    for (const [k, v] of Object.entries(groups)) {
+      if (Number(v?.chat_id) === chatId) {
+        groupKey = k;
+        break;
+      }
+    }
+
+    if (!groupKey) {
+      return send(
+        bot,
+        msg,
+        "⚠️ Este grupo não está registrado.\nUse: /setgroup vendas | compras | producao | financeiro | relatorios | backups"
       );
-    } catch (err) {
-      logger.error('Erro no comando /start:', err.message);
     }
+
+    await send(bot, msg, `📌 Menu do grupo: ${groupKey}`, {
+      reply_markup: menuForGroupKey(groupKey),
+    });
   });
 
-  bot.onText(/^\/id$/, async (msg) => {
-    try {
-      if (!isAdmin(config, msg) && msg.chat.type === 'private') {
-        return bot.sendMessage(msg.chat.id, "❌ Comando restrito ao administrador.");
-      }
+  // =========================
+  // /ia (IA em qualquer grupo/tópico)
+  // =========================
+  bot.onText(/^\/ia(?:\s+([\s\S]+))?$/i, async (msg, match) => {
+    if (msg.from?.id !== adminId) return;
 
-      const info = [
-        `📌 Informações do Chat`,
-        ``,
-        `Chat ID: \`${msg.chat.id}\``,
-        `Tipo: ${msg.chat.type}`,
-        `User ID: \`${msg.from.id}\``,
-        msg.chat.title ? `Título: ${msg.chat.title}` : '',
-        msg.chat.is_forum ? `Forum: Sim` : ''
-      ].filter(Boolean).join('\n');
-
-      await bot.sendMessage(msg.chat.id, info, { parse_mode: 'Markdown' });
-    } catch (err) {
-      logger.error('Erro no comando /id:', err.message);
+    const prompt = String(match?.[1] || "").trim();
+    if (!prompt) {
+      return send(
+        bot,
+        msg,
+        "Digite assim:\n\n/ia Como está o andamento das vendas?\n\nOu use: IA: <pergunta> em qualquer mensagem."
+      );
     }
+
+    const apiKey = process.env.OPENAI_API_KEY || config?.openai?.apiKey;
+    const model = process.env.OPENAI_MODEL || config?.openai?.model || "gpt-4o-mini";
+
+    const groups = await getGroups(db);
+    const context = {
+      groups,
+      note: "IA responde no grupo e no mesmo tópico. A IA analisa principalmente ARQUIVOS (documentos).",
+    };
+
+    const answer = await askOpenAI({
+      apiKey,
+      model,
+      messages: [
+        { role: "system", content: "Você é um assistente de ERP para uma empresa de estofados. Responda curto e prático." },
+        { role: "user", content: `Contexto JSON:\n${JSON.stringify(context)}\n\nPergunta:\n${prompt}` },
+      ],
+      maxTokens: 700,
+      temperature: 0.2,
+    });
+
+    await send(bot, msg, answer || "Sem resposta no momento.");
   });
 
-  bot.onText(/^\/setgroup(?:\s+(.+))?$/i, async (msg, match) => {
+  // =========================
+  // /setgroup <nome>  (registra grupos)
+  // =========================
+  bot.onText(/^\/setgroup\s+(\w+)$/i, async (msg, match) => {
     try {
-      if (!isAdmin(config, msg)) {
-        return bot.sendMessage(msg.chat.id, "❌ Sem permissão. Este comando é restrito ao administrador.");
+      if (msg.from?.id !== adminId) return;
+
+      const key = String(match?.[1] || "").toLowerCase();
+      const allowed = ["compras", "vendas", "producao", "financeiro", "relatorios", "backups"];
+      if (!allowed.includes(key)) {
+        return send(bot, msg, `❌ Nome inválido. Use: ${allowed.join(" | ")}`);
       }
 
-      const gName = normalizeGroupName(match?.[1]);
-      const validGroups = ['vendas', 'producao', 'compras', 'financeiro', 'relatorios', 'backups'];
-
-      if (!gName) {
-        return bot.sendMessage(
-          msg.chat.id, 
-          `❌ Uso: /setgroup <nome>\n\nGrupos válidos:\n${validGroups.map(g => `• ${g}`).join('\n')}`
-        );
-      }
-
-      if (!validGroups.includes(gName)) {
-        return bot.sendMessage(
-          msg.chat.id,
-          `❌ Grupo "${gName}" inválido.\n\nGrupos válidos:\n${validGroups.map(g => `• ${g}`).join('\n')}`
-        );
-      }
-
-      const isForum = msg.chat?.is_forum === true || msg.is_forum === true;
-      const groups = (await db.kvGet("groups")) || {};
-
-      groups[gName] = { 
-        chat_id: msg.chat.id, 
-        title: msg.chat?.title || gName, 
-        is_forum: !!isForum, 
-        updated_at: nowIso() 
+      const chat = msg.chat;
+      const payload = {
+        chat_id: Number(chat.id),
+        title: chat.title || key,
+        is_forum: !!chat.is_forum,
+        updated_at: new Date().toISOString(),
       };
 
-      await db.kvSet("groups", groups);
+      await setGroup(db, key, payload);
 
-      return bot.sendMessage(
-        msg.chat.id, 
-        `✅ Grupo registrado com sucesso!\n\n` +
-        `Nome: ${gName}\n` +
-        `Chat ID: \`${msg.chat.id}\`\n` +
-        `Fórum/Tópicos: ${isForum ? "✅ Sim" : "❌ Não"}`,
-        { parse_mode: 'Markdown' }
+      await send(
+        bot,
+        msg,
+        `✅ Grupo registrado com sucesso!\n\nNome: ${key}\nChat ID: ${payload.chat_id}\nFórum/Tópicos: ${payload.is_forum ? "SIM" : "NÃO"}`
       );
     } catch (err) {
-      logger.error('Erro no comando /setgroup:', err.message);
-      bot.sendMessage(msg.chat.id, `❌ Erro ao registrar grupo: ${err.message}`);
+      logger.error("Erro ao registrar grupo:", err?.message || err);
+      await send(bot, msg, `❌ Erro ao registrar grupo: ${err?.message || err}`);
     }
   });
 
-  bot.onText(/^\/menu$/i, async (msg) => {
+  // =========================
+  // CALLBACKS (botões)
+  // =========================
+  bot.on("callback_query", async (q) => {
     try {
-      const groups = (await db.kvGet("groups")) || {};
-      const groupName = getGroupNameByChatId(groups, msg.chat.id);
+      const data = q.data || "";
+      const msg = q.message;
 
-      if (msg.chat.type === "private") {
-        if (!isAdmin(config, msg)) {
-          return bot.sendMessage(msg.chat.id, "❌ Sem permissão.");
-        }
-        return bot.sendMessage(
-          msg.chat.id, 
-          "📊 Painel Administrativo\n\nEscolha um módulo:", 
-          buildMainMenu()
-        );
-      }
-
-      if (!groupName) {
-        return bot.sendMessage(
-          msg.chat.id, 
-          "⚠️ Este grupo não está registrado.\n\nO administrador deve usar:\n/setgroup <nome>"
-        );
-      }
-
-      return bot.sendMessage(
-        msg.chat.id, 
-        `📌 Menu do grupo: *${groupName}*`, 
-        { 
-          ...buildGroupMenu(groupName),
-          parse_mode: 'Markdown'
-        }
-      );
-    } catch (err) {
-      logger.error('Erro no comando /menu:', err.message);
-    }
-  });
-
-  bot.onText(/^\/runreport$/i, async (msg) => {
-    try {
-      if (!isAdmin(config, msg)) {
-        return bot.sendMessage(msg.chat.id, "❌ Sem permissão.");
-      }
-
-      await bot.sendMessage(msg.chat.id, "⏳ Gerando relatório...");
-      const result = await runDailyWork({ config, db, bot, mode: "manual" });
-      return bot.sendMessage(msg.chat.id, `✅ Relatório gerado!\n\n${result.summary}`);
-    } catch (err) {
-      logger.error('Erro no comando /runreport:', err.message);
-      bot.sendMessage(msg.chat.id, `❌ Erro ao gerar relatório: ${err.message}`);
-    }
-  });
-
-  bot.onText(/^\/stats$/i, async (msg) => {
-    try {
-      if (!isAdmin(config, msg)) {
-        return bot.sendMessage(msg.chat.id, "❌ Sem permissão.");
-      }
-
-      const groups = (await db.kvGet("groups")) || {};
-      const uploadsCount = (await db.prepare('SELECT COUNT(*)::int as count FROM uploads WHERE deleted_at IS NULL').get()).count;
-      const txCount = (await db.prepare('SELECT COUNT(*)::int as count FROM bank_tx').get()).count;
-      const ordersCount = (await db.prepare('SELECT COUNT(*)::int as count FROM orders WHERE deleted_at IS NULL').get()).count;
-
-      const stats = [
-        `📊 *Estatísticas do Sistema*`,
-        ``,
-        `👥 Grupos: ${Object.keys(groups).length}`,
-        `📁 Uploads: ${uploadsCount}`,
-        `💰 Transações: ${txCount}`,
-        `📦 Pedidos: ${ordersCount}`,
-        ``,
-        `🕐 ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}`
-      ].join('\n');
-
-      await bot.sendMessage(msg.chat.id, stats, { parse_mode: 'Markdown' });
-    } catch (err) {
-      logger.error('Erro no comando /stats:', err.message);
-      bot.sendMessage(msg.chat.id, `❌ Erro: ${err.message}`);
-    }
-  });
-
-  // ========================================
-  // HANDLER DE DOCUMENTOS/ARQUIVOS
-  // ========================================
-
-  bot.on("document", async (msg) => {
-    const doc = msg.document;
-
-    try {
-      logger.info(`Arquivo recebido: ${doc.file_name} (${doc.file_size} bytes)`);
-
-      if (doc.file_size > MAX_FILE_SIZE) {
-        return bot.sendMessage(
-          msg.chat.id, 
-          `❌ Arquivo muito grande: ${(doc.file_size / 1024 / 1024).toFixed(2)}MB\n\nTamanho máximo: ${MAX_FILE_SIZE / 1024 / 1024}MB`
-        );
-      }
-
-      if (!ALLOWED_MIME_TYPES.includes(doc.mime_type)) {
-        return bot.sendMessage(
-          msg.chat.id, 
-          `❌ Tipo de arquivo não permitido: ${doc.mime_type}\n\nPermitidos: CSV, PDF, Excel`
-        );
-      }
-
-      const groups = (await db.kvGet("groups")) || {};
-      const groupName = getGroupNameByChatId(groups, msg.chat.id);
-
-      const fileLink = await bot.getFileLink(doc.file_id);
-
-      const folder = path.join(__dirname, "..", "storage");
-      if (!fs.existsSync(folder)) fs.mkdirSync(folder, { recursive: true });
-
-      const safeFileName = (doc.file_name || "file")
-        .replace(/[^a-zA-Z0-9._-]/g, '_')
-        .substring(0, 200);
-      const safeName = `${Date.now()}_${doc.file_unique_id}_${safeFileName}`;
-      const localPath = path.join(folder, safeName);
-
-      logger.info(`Baixando arquivo de: ${fileLink}`);
-      const downloadedSize = await downloadTo(localPath, fileLink);
-      logger.info(`Download concluído: ${downloadedSize} bytes`);
-
-      const buf = fs.readFileSync(localPath);
-      const sha = crypto.createHash("sha256").update(buf).digest("hex");
-
-      const lower = (doc.file_name || "").toLowerCase();
-      const kind = lower.endsWith(".csv") ? "bank_csv" :
-                   lower.endsWith(".pdf") ? "order_pdf" : 
-                   "other";
-
-      await db.prepare(`
-        INSERT INTO uploads(
-          created_at, kind, filename, telegram_file_id, telegram_chat_id, 
-          telegram_message_id, local_path, sha256, file_size, meta_json
-        )
-        VALUES(?,?,?,?,?,?,?,?,?,?)
-      `).run(
-        nowIso(), 
-        kind, 
-        doc.file_name || safeName, 
-        doc.file_id, 
-        msg.chat.id, 
-        msg.message_id, 
-        localPath, 
-        sha,
-        doc.file_size,
-        JSON.stringify({ groupName, from_id: msg.from.id, mime: doc.mime_type })
-      );
-
-      logger.info(`Arquivo salvo no banco: ${doc.file_name}`);
-
-      // Auto-import CSV do Nubank (apenas admin e grupos específicos)
-      if (kind === "bank_csv" && isAdmin(config, msg) && (groupName === "financeiro" || groupName === "backups")) {
-        logger.info('Iniciando importação de CSV Nubank...');
-        const parsed = parseNubankCsvBuffer(buf);
-
-        const insSql = `
-          INSERT INTO bank_tx(
-            created_at, source, tx_date, description, category, 
-            amount_cents, direction, account, counterparty, raw_json
-          )
-          VALUES(?,?,?,?,?,?,?,?,?,?)
-        `;
-
-        let imported = 0;
-
-        await db.transaction(async (tx) => {
-          for (const t of parsed) {
-            await tx.prepare(insSql).run(
-              nowIso(),
-              "nubank_csv",
-              t.tx_date || null,
-              t.description || null,
-              t.category || null,
-              t.amount_cents || 0,
-              t.direction || null,
-              null,
-              null,
-              JSON.stringify(t.raw || {})
-            );
-            imported += 1;
-          }
+      // Menu
+      if (data === "menu:vendas:crm") {
+        await bot.sendMessage(msg.chat.id, "📒 CRM: em breve (lista/etapas).", {
+          message_thread_id: msg.message_thread_id,
         });
+        return bot.answerCallbackQuery(q.id);
+      }
+
+      if (data === "menu:vendas:nova") {
+        await bot.sendMessage(
+          msg.chat.id,
+          "🧾 Para registrar venda, mande assim:\n\nCliente: Mariza\nProduto: Sofá 3 lugares\nValor: 3600\nObs: Produção nova\n\nOu mensagem natural:\ncliente mariza produção sofá 3 lugares valor 3600",
+          { message_thread_id: msg.message_thread_id }
+        );
+        return bot.answerCallbackQuery(q.id);
+      }
+
+      // ===============================
+      // CONFIRMAÇÃO DE VENDA (A1)
+      // ===============================
+      if (data.startsWith("sale:ok:")) {
+        const token = data.replace("sale:ok:", "");
+        const draft = await db.kvGet(`draft_sale:${token}`);
+        if (!draft) return bot.answerCallbackQuery(q.id, { text: "Draft expirou." });
+
+        const rows = await db.query(
+          `INSERT INTO orders (customer_name, description, amount_cents, status, production_status, meta_json, created_at, updated_at)
+           VALUES ($1,$2,$3,'confirmed','not_started',$4,NOW(),NOW())
+           RETURNING id`,
+          [
+            draft.customer_name,
+            draft.description,
+            draft.amount_cents,
+            { source: "telegram:vendas", token, raw_text: draft.raw_text || "" },
+          ]
+        );
+
+        await db.kvDelete(`draft_sale:${token}`);
 
         await bot.sendMessage(
           msg.chat.id,
-          `✅ CSV Nubank importado com sucesso!\n\nTransações importadas: ${imported}`
+          `✅ Venda registrada! Pedido #${rows[0].id}`,
+          { message_thread_id: msg.message_thread_id }
         );
-      } else {
-        await bot.sendMessage(msg.chat.id, `✅ Arquivo recebido e registrado: ${doc.file_name}`);
+
+        return bot.answerCallbackQuery(q.id, { text: "Venda criada ✅" });
       }
 
+      if (data.startsWith("sale:no:")) {
+        const token = data.replace("sale:no:", "");
+        await db.kvDelete(`draft_sale:${token}`);
+        await bot.sendMessage(msg.chat.id, "❌ Venda cancelada.", {
+          message_thread_id: msg.message_thread_id,
+        });
+        return bot.answerCallbackQuery(q.id, { text: "Cancelado" });
+      }
+
+      return bot.answerCallbackQuery(q.id);
     } catch (err) {
-      logger.error('Erro ao processar arquivo:', err.message);
-      try { await bot.sendMessage(msg.chat.id, `❌ Erro ao processar arquivo: ${err.message}`); } catch {}
+      logger.error("callback_query erro:", err?.message || err);
+      try {
+        await bot.answerCallbackQuery(q.id, { text: "Erro." });
+      } catch {}
+    }
+  });
+
+  // ===============================
+  // IA + VENDAS por mensagem (QUALQUER TÓPICO)
+  // ===============================
+  bot.on("message", async (msg) => {
+    try {
+      // ignora comandos (tratados acima)
+      if (msg.text && msg.text.startsWith("/")) return;
+
+      const groups = await getGroups(db);
+
+      // ============ IA EM QUALQUER GRUPO/TÓPICO ============
+      // Só dispara quando você chamar: "IA: ..." ou "/ia ..." ou "gpt: ..."
+      if (msg.text && shouldCallIA(msg.text)) {
+        if (msg.from?.id !== adminId) return; // você pode remover isso se quiser permitir para equipe
+
+        const apiKey = process.env.OPENAI_API_KEY || config?.openai?.apiKey;
+        const model = process.env.OPENAI_MODEL || config?.openai?.model || "gpt-4o-mini";
+
+        const userPrompt = extractIAQuery(msg.text);
+        if (!userPrompt) return;
+
+        // contexto leve: quais grupos existem e qual grupo atual
+        let currentGroupKey = null;
+        for (const [k, v] of Object.entries(groups)) {
+          if (Number(v?.chat_id) === Number(msg.chat.id)) {
+            currentGroupKey = k;
+            break;
+          }
+        }
+
+        const context = {
+          current_group: currentGroupKey,
+          groups_registered: Object.keys(groups),
+          note: "Responda curto e prático. Se pedir análise de arquivo, oriente enviar PDF/CSV/documento.",
+        };
+
+        const answer = await askOpenAI({
+          apiKey,
+          model,
+          messages: [
+            { role: "system", content: "Você é uma IA de ERP. Responda curto, direto e com passos." },
+            { role: "user", content: `Contexto JSON:\n${JSON.stringify(context)}\n\nPergunta:\n${userPrompt}` },
+          ],
+          maxTokens: 700,
+          temperature: 0.2,
+        });
+
+        await send(bot, msg, answer || "Sem resposta no momento.");
+        return;
+      }
+
+      // ============ VENDAS AUTOMÁTICA (mensagem normal no grupo VENDAS) ============
+      const vendasChatId = groups?.vendas?.chat_id;
+      if (vendasChatId && Number(msg.chat.id) === Number(vendasChatId) && msg.text) {
+        const parsed = parseSaleText(msg.text);
+        if (!parsed) return;
+
+        // C2: se faltar valor, perguntar antes
+        if (!parsed.amount_cents || parsed.amount_cents <= 0) {
+          await send(
+            bot,
+            msg,
+            "💰 Entendi a venda, mas faltou o VALOR.\nResponda assim:\n\nValor: 3600"
+          );
+          return;
+        }
+
+        // A1: confirmar antes de criar
+        const token = `${msg.chat.id}:${msg.message_id}`;
+
+        await db.kvSet(`draft_sale:${token}`, {
+          chat_id: msg.chat.id,
+          message_id: msg.message_id,
+          ...parsed,
+          created_at: new Date().toISOString(),
+        });
+
+        await send(
+          bot,
+          msg,
+          `🧾 Confirma criar esta venda?\n\n` +
+            `Cliente: ${parsed.customer_name || "(não informado)"}\n` +
+            `Descrição: ${parsed.description || "(não informado)"}\n` +
+            `Valor: R$ ${(parsed.amount_cents / 100).toFixed(2).replace(".", ",")}\n\n` +
+            `✅ Confirmar ou ❌ Cancelar`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "✅ Confirmar", callback_data: `sale:ok:${token}` },
+                  { text: "❌ Cancelar", callback_data: `sale:no:${token}` },
+                ],
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      // ============ ARQUIVOS (IA só para documentos) ============
+      // (prints/imagens não analisamos — decisão sua)
+      if (msg.document) {
+        // aqui você pode evoluir depois para baixar e extrair texto de CSV/PDF
+        // por enquanto: confirma recebimento e orienta
+        await send(
+          bot,
+          msg,
+          `📎 Arquivo recebido: ${msg.document.file_name || "documento"}\n` +
+            `✅ Registrado. Se quiser análise, mande junto uma mensagem começando com:\n` +
+            `IA: analisar este arquivo e resumir pontos importantes.`
+        );
+      }
+    } catch (err) {
+      logger.error("message handler erro:", err?.message || err);
     }
   });
 

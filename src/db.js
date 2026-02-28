@@ -1,9 +1,12 @@
-// src/db.js
+// src/db.js (VERSÃO DEFININITIVA ANTI-ERRO 42703)
 const { Pool } = require("pg");
 
 function makePool() {
   const DATABASE_URL = process.env.DATABASE_URL;
-  if (!DATABASE_URL) throw new Error("DATABASE_URL não configurado");
+
+  if (!DATABASE_URL) {
+    throw new Error("DATABASE_URL não configurado no Render");
+  }
 
   return new Pool({
     connectionString: DATABASE_URL,
@@ -16,95 +19,84 @@ async function exec(pool, sql, params = []) {
 }
 
 async function initSchema(pool) {
-  console.log("🧠 Sincronizando banco...");
+  console.log("🧠 Sincronizando banco... (modo seguro)");
 
-  // 1) Garante que a tabela exista (pode existir antiga)
+  // 1) CRIA TABELA BASE SUPER SIMPLES (SEM ÍNDICES)
   await exec(
     pool,
     `
     CREATE TABLE IF NOT EXISTS events (
-      id BIGSERIAL PRIMARY KEY,
-      chat_id BIGINT,
-      text TEXT,
-      tag TEXT,
-      payload JSONB,
-      created_at TIMESTAMPTZ DEFAULT NOW()
+      id BIGSERIAL PRIMARY KEY
     );
   `
   );
 
-  // 2) MIGRAÇÕES (pra quem já tinha tabela antiga)
+  // 2) MIGRAÇÃO SEGURA COLUNA POR COLUNA (ESSA PARTE EVITA O ERRO 42703)
   await exec(pool, `ALTER TABLE events ADD COLUMN IF NOT EXISTS chat_id BIGINT;`);
   await exec(pool, `ALTER TABLE events ADD COLUMN IF NOT EXISTS text TEXT;`);
   await exec(pool, `ALTER TABLE events ADD COLUMN IF NOT EXISTS tag TEXT;`);
   await exec(pool, `ALTER TABLE events ADD COLUMN IF NOT EXISTS payload JSONB;`);
-  await exec(pool, `ALTER TABLE events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
-
-  // Se sua tabela antiga usava coluna "message", copia pra "text"
-  // (não dá erro se não existir)
   await exec(
     pool,
-    `
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_name='events' AND column_name='message'
-      ) THEN
-        UPDATE events
-        SET text = COALESCE(text, message)
-        WHERE text IS NULL;
-      END IF;
-    END $$;
-  `
+    `ALTER TABLE events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`
   );
 
-  // 3) Regras/ordens da IA (para "passar a fazer algo" e ela lembrar)
+  // 3) TABELA DE REGRAS DA IA (ORDENS PERMANENTES)
   await exec(
     pool,
     `
     CREATE TABLE IF NOT EXISTS ai_rules (
       id BIGSERIAL PRIMARY KEY,
       rule TEXT NOT NULL,
-      active BOOLEAN NOT NULL DEFAULT true,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `
   );
 
-  // 4) Financeiro estruturado (lançamento por linha do CSV)
+  // 4) TABELA FINANCEIRA (PARA CSV / PDF / EXTRATOS)
   await exec(
     pool,
     `
     CREATE TABLE IF NOT EXISTS financial_records (
       id BIGSERIAL PRIMARY KEY,
       chat_id BIGINT,
-      ref TEXT,
-      source TEXT,
       date DATE,
-      direction TEXT,
       amount NUMERIC,
       description TEXT,
       payee TEXT,
       category TEXT,
+      source TEXT,
       raw JSONB,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `
   );
 
-  // índices
-  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_fin_chat ON financial_records(chat_id);`);
-  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_fin_date ON financial_records(date);`);
-  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_fin_payee ON financial_records(payee);`);
+  // 5) AGORA SIM CRIAR ÍNDICES (DEPOIS DAS COLUNAS EXISTIREM)
+  await exec(
+    pool,
+    `CREATE INDEX IF NOT EXISTS idx_events_chat_id ON events(chat_id);`
+  );
+  await exec(
+    pool,
+    `CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);`
+  );
+  await exec(
+    pool,
+    `CREATE INDEX IF NOT EXISTS idx_financial_chat ON financial_records(chat_id);`
+  );
 
-  console.log("✅ Banco OK (migrado): events / ai_rules / financial_records");
+  console.log("✅ Banco sincronizado com sucesso (migração segura aplicada)");
 }
 
 async function createDb() {
   const pool = makePool();
+
+  // Testa conexão primeiro
   await exec(pool, "SELECT 1");
+
+  // Depois sincroniza
   await initSchema(pool);
 
   return {

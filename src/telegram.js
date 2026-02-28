@@ -1,94 +1,102 @@
-const { processMessage } = require("./workflow");
+// src/telegram.js
+const fetch = require("node-fetch");
 
-function envInt(name, required = true) {
-  const v = process.env[name];
-  if (!v && required) throw new Error(`${name} não configurado`);
-  if (!v) return null;
-  return Number(v);
-}
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADM_CHAT_ID = Number(process.env.ADM_CHAT_ID);
+const PROD_CHAT_ID = Number(process.env.PROD_CHAT_ID);
 
-function envStr(name, required = true) {
-  const v = process.env[name];
-  if (!v && required) throw new Error(`${name} não configurado`);
-  return v || null;
-}
-
-function makeTelegram({ db }) {
-  const BOT_TOKEN = envStr("BOT_TOKEN");
-  const TELEGRAM_ADMIN_ID = envInt("TELEGRAM_ADMIN_ID");
-  const ADM_CHAT_ID = envInt("ADM_CHAT_ID");
-  const PROD_CHAT_ID = envInt("PROD_CHAT_ID");
-
-  const apiBase = `https://api.telegram.org/bot${BOT_TOKEN}`;
-
-  async function api(method, body) {
-    const r = await fetch(`${apiBase}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!r.ok) {
-      const t = await r.text();
-      throw new Error(`Telegram API ${method} ${r.status}: ${t}`);
-    }
-    return r.json();
-  }
-
-  async function sendMessage(chatId, text, extra = {}) {
-    return api("sendMessage", {
+async function sendMessage(chatId, text) {
+  const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+  await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
       chat_id: chatId,
       text,
       parse_mode: "HTML",
-      disable_web_page_preview: true,
-      ...extra,
-    });
-  }
-
-  async function getFileLink(fileId) {
-    const data = await api("getFile", { file_id: fileId });
-    const filePath = data?.result?.file_path;
-    if (!filePath) throw new Error("Não consegui pegar file_path do Telegram");
-    return `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-  }
-
-  function isOurChat(chatId) {
-    return chatId === ADM_CHAT_ID || chatId === PROD_CHAT_ID;
-  }
-
-  function chatLabel(chatId) {
-    return chatId === ADM_CHAT_ID ? "ADM" : chatId === PROD_CHAT_ID ? "PRODUÇÃO" : "OUTRO";
-  }
-
-  async function handleUpdate(update) {
-    const msg = update.message || update.edited_message;
-    if (!msg) return;
-
-    const chatId = msg.chat?.id;
-    if (!chatId || !isOurChat(chatId)) return;
-
-    const fromId = msg.from?.id;
-    const fromName =
-      [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(" ").trim() ||
-      (msg.from?.username ? `@${msg.from.username}` : "desconhecido");
-    const text = msg.text || msg.caption || "";
-
-    await processMessage({
-      db,
-      tg: { sendMessage, getFileLink },
-      message: {
-        chatId,
-        chatLabel: chatLabel(chatId),
-        fromId,
-        fromName,
-        messageId: msg.message_id,
-        text,
-        doc: msg.document || null,
-      },
-      context: { TELEGRAM_ADMIN_ID, ADM_CHAT_ID, PROD_CHAT_ID },
-    });
-  }
-
-  return { handleUpdate, sendMessage, ADM_CHAT_ID, PROD_CHAT_ID };
+    }),
+  });
 }
 
-module.exports = { makeTelegram };
+function isAllowedChat(chatId) {
+  return chatId === ADM_CHAT_ID || chatId === PROD_CHAT_ID;
+}
+
+async function handleTelegramUpdate(update, db) {
+  try {
+    if (!update.message) return;
+
+    const msg = update.message;
+    const chatId = msg.chat.id;
+    const text = msg.text || "";
+
+    // Ignorar chats fora do ADM e PRODUÇÃO
+    if (!isAllowedChat(chatId)) return;
+
+    // Salvar evento no banco (memória da IA)
+    await db.exec(
+      `INSERT INTO events (chat_id, chat_type, from_id, from_name, message_id, text, payload)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        chatId,
+        msg.chat.type,
+        msg.from?.id || null,
+        msg.from?.first_name || "unknown",
+        msg.message_id,
+        text,
+        update,
+      ]
+    );
+
+    // ===== CÉREBRO SIMPLES DA IA (resposta automática) =====
+    if (!text) return;
+
+    const lower = text.toLowerCase();
+
+    // Mensagens operacionais importantes
+    if (
+      lower.includes("pedido") ||
+      lower.includes("cliente") ||
+      lower.includes("valor") ||
+      lower.includes("orçamento") ||
+      lower.includes("produção")
+    ) {
+      await sendMessage(
+        chatId,
+        `🧠 Interpretação da IA:
+Mensagem operacional detectada.
+Estou analisando e organizando o processo.`
+      );
+      return;
+    }
+
+    // Teste / mensagens comuns
+    if (lower.includes("teste")) {
+      await sendMessage(
+        chatId,
+        "✅ IA online e monitorando operações da empresa."
+      );
+      return;
+    }
+
+    // Bom dia / conversa simples (modo gerente silencioso)
+    if (lower.includes("bom dia") || lower.includes("boa tarde") || lower.includes("boa noite")) {
+      await sendMessage(
+        chatId,
+        "📊 IA ativa. Monitorando processos e decisões."
+      );
+      return;
+    }
+
+    // Resposta padrão inteligente (centralização total)
+    await sendMessage(
+      chatId,
+      `🧠 Mensagem recebida e registrada.
+Nenhuma ação operacional necessária no momento.`
+    );
+  } catch (error) {
+    console.error("Erro no Telegram handler:", error);
+  }
+}
+
+module.exports = { handleTelegramUpdate };

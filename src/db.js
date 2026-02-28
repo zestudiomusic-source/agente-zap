@@ -10,15 +10,9 @@ function createLogger(name = "DB") {
 function createDb(config) {
   const logger = createLogger("DB");
 
-  if (!process.env.DATABASE_URL && !config?.db?.url) {
-    throw new Error("DATABASE_URL não configurado!");
-  }
-
   const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || config.db.url,
-    ssl: {
-      rejectUnauthorized: false,
-    },
+    connectionString: process.env.DATABASE_URL || config?.db?.url,
+    ssl: { rejectUnauthorized: false },
   });
 
   const db = {
@@ -46,15 +40,12 @@ function createDb(config) {
       try {
         await client.query("BEGIN");
         const tx = {
-          exec: async (sql, params = []) => {
-            await client.query(sql, params);
-          },
+          exec: (sql, params = []) => client.query(sql, params),
           query: async (sql, params = []) => {
             const res = await client.query(sql, params);
             return res.rows;
           },
         };
-
         const result = await callback(tx);
         await client.query("COMMIT");
         return result;
@@ -65,13 +56,34 @@ function createDb(config) {
         client.release();
       }
     },
+
+    // 🔥 FUNÇÕES KV (ESSENCIAIS PARA O ERP)
+    async kvGet(key) {
+      const rows = await this.query(
+        `SELECT value_json FROM kv_store WHERE key = $1`,
+        [key]
+      );
+      return rows[0]?.value_json || null;
+    },
+
+    async kvSet(key, value) {
+      await this.exec(
+        `INSERT INTO kv_store (key, value_json, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key)
+         DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = NOW()`,
+        [key, value]
+      );
+    },
+
+    async kvDelete(key) {
+      await this.exec(`DELETE FROM kv_store WHERE key = $1`, [key]);
+    },
   };
 
   async function initSchema() {
     await db.transaction(async (tx) => {
-      // ===========================
-      // TABELA PRINCIPAL DE PEDIDOS
-      // ===========================
+      // TABELA ORDERS
       await tx.exec(`
         CREATE TABLE IF NOT EXISTS orders (
           id SERIAL PRIMARY KEY,
@@ -79,29 +91,29 @@ function createDb(config) {
         );
       `);
 
-      // ===========================
-      // MIGRAÇÃO DE SCHEMA (CRÍTICA)
-      // Corrige bancos antigos que já tinham a tabela sem as colunas novas
-      // ===========================
+      // MIGRAÇÃO SEGURA
       await tx.exec(`
         ALTER TABLE orders
           ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'pending',
           ADD COLUMN IF NOT EXISTS production_status TEXT DEFAULT 'not_started',
-          ADD COLUMN IF NOT EXISTS delivery_date DATE,
           ADD COLUMN IF NOT EXISTS description TEXT,
           ADD COLUMN IF NOT EXISTS customer_name TEXT,
           ADD COLUMN IF NOT EXISTS customer_phone TEXT,
-          ADD COLUMN IF NOT EXISTS customer_email TEXT,
           ADD COLUMN IF NOT EXISTS amount_cents BIGINT DEFAULT 0,
-          ADD COLUMN IF NOT EXISTS notes TEXT,
           ADD COLUMN IF NOT EXISTS meta_json JSONB,
-          ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ,
-          ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+          ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
       `);
 
-      // ===========================
-      // TABELA FINANCEIRO
-      // ===========================
+      // KV STORE (CRÍTICO PARA /setgroup)
+      await tx.exec(`
+        CREATE TABLE IF NOT EXISTS kv_store (
+          key TEXT PRIMARY KEY,
+          value_json JSONB,
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `);
+
+      // FINANCEIRO
       await tx.exec(`
         CREATE TABLE IF NOT EXISTS finance (
           id SERIAL PRIMARY KEY,
@@ -112,43 +124,9 @@ function createDb(config) {
           meta_json JSONB
         );
       `);
-
-      // ===========================
-      // TABELA CONFIG / KV (cache, tokens, etc)
-      // ===========================
-      await tx.exec(`
-        CREATE TABLE IF NOT EXISTS kv_store (
-          key TEXT PRIMARY KEY,
-          value_json JSONB,
-          updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-      `);
-
-      // ===========================
-      // ÍNDICES (agora não quebram mais)
-      // ===========================
-      await tx.exec(`
-        CREATE INDEX IF NOT EXISTS idx_orders_status
-        ON orders(status);
-      `);
-
-      await tx.exec(`
-        CREATE INDEX IF NOT EXISTS idx_orders_created_at
-        ON orders(created_at);
-      `);
-
-      await tx.exec(`
-        CREATE INDEX IF NOT EXISTS idx_finance_created_at
-        ON finance(created_at);
-      `);
     });
 
     logger.info("Schema do banco inicializado com sucesso.");
-  }
-
-  async function create() {
-    await initSchema();
-    return db;
   }
 
   return {

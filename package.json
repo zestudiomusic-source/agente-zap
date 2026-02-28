@@ -1,20 +1,18 @@
 {
   "name": "erp-ia-central",
-  "version": "2.0.0",
-  "description": "ERP Telegram com IA central (ADM + PRODUÇÃO), relatórios diários/semanais e leitura de PDF/CSV.",
-  "main": "server.js",
-  "type": "commonjs",
+  "version": "1.0.0",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node src/server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "pg": "^8.11.5",
+    "axios": "^1.6.0",
+    "body-parser": "^1.20.2",
+    "express": "^4.18.2",
+    "node-fetch": "^2.6.7",
     "node-cron": "^3.0.3",
+    "pg": "^8.11.3",
     "pdf-parse": "^1.1.1",
-    "csv-parse": "^5.5.6"
-  },
-  "engines": {
-    "node": ">=18"
+    "csv-parse": "^5.5.0"
   }
 }

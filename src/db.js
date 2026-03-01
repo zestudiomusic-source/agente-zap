@@ -1,4 +1,4 @@
-// src/db.js (CEO MODE - ultra safe migrations)
+// src/db.js
 const { Pool } = require("pg");
 
 function makePool() {
@@ -15,26 +15,32 @@ async function exec(pool, sql, params = []) {
 }
 
 async function initSchema(pool) {
-  console.log("🧠 Sincronizando banco... (CEO mode)");
+  console.log("🧠 Sincronizando banco...");
 
-  // Sempre public.*
-  await exec(pool, `CREATE SCHEMA IF NOT EXISTS public;`);
-
-  // EVENTS (log geral)
+  // EVENTS (log do chat + ações)
   await exec(pool, `
     CREATE TABLE IF NOT EXISTS public.events (
-      id BIGSERIAL PRIMARY KEY
+      id BIGSERIAL PRIMARY KEY,
+      chat_id BIGINT,
+      role TEXT,
+      text TEXT,
+      tag TEXT,
+      payload JSONB,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
 
+  // garante colunas (para bases antigas)
   await exec(pool, `ALTER TABLE public.events ADD COLUMN IF NOT EXISTS chat_id BIGINT;`);
-  await exec(pool, `ALTER TABLE public.events ADD COLUMN IF NOT EXISTS role TEXT;`);        // user/assistant/system
+  await exec(pool, `ALTER TABLE public.events ADD COLUMN IF NOT EXISTS role TEXT;`);
   await exec(pool, `ALTER TABLE public.events ADD COLUMN IF NOT EXISTS text TEXT;`);
-  await exec(pool, `ALTER TABLE public.events ADD COLUMN IF NOT EXISTS tag TEXT;`);         // finance/pdf/order/etc
+  await exec(pool, `ALTER TABLE public.events ADD COLUMN IF NOT EXISTS tag TEXT;`);
   await exec(pool, `ALTER TABLE public.events ADD COLUMN IF NOT EXISTS payload JSONB;`);
   await exec(pool, `ALTER TABLE public.events ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();`);
 
-  // MEMORY (contexto linear por chat)
+  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_events_chat_time ON public.events(chat_id, created_at);`);
+
+  // MEMÓRIA PERSISTENTE por chat (resumo curto)
   await exec(pool, `
     CREATE TABLE IF NOT EXISTS public.chat_memory (
       chat_id BIGINT PRIMARY KEY,
@@ -43,20 +49,21 @@ async function initSchema(pool) {
     );
   `);
 
-  // PENDING ACTIONS (fila de ações com confirmação)
+  // PENDÊNCIAS (confirmação sim/não)
   await exec(pool, `
     CREATE TABLE IF NOT EXISTS public.pending_actions (
       id BIGSERIAL PRIMARY KEY,
       chat_id BIGINT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',  -- pending/approved/rejected/done/error
       question TEXT NOT NULL,
       plan JSONB NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',  -- pending/approved/rejected/done/error
       created_at TIMESTAMPTZ DEFAULT NOW(),
       decided_at TIMESTAMPTZ
     );
   `);
+  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_pending_chat ON public.pending_actions(chat_id, status);`);
 
-  // RULES (ordens permanentes do dono)
+  // REGRAS PERMANENTES (ordens que você manda e ficam ativas)
   await exec(pool, `
     CREATE TABLE IF NOT EXISTS public.ai_rules (
       id BIGSERIAL PRIMARY KEY,
@@ -67,15 +74,15 @@ async function initSchema(pool) {
     );
   `);
 
-  // FINANCE (lançamentos estruturados)
+  // FINANCEIRO
   await exec(pool, `
     CREATE TABLE IF NOT EXISTS public.financial_records (
       id BIGSERIAL PRIMARY KEY,
       chat_id BIGINT,
-      source TEXT,              -- csv/pdf/manual
-      ref TEXT,                 -- id do arquivo/linha
+      source TEXT,
+      ref TEXT,
       date DATE,
-      direction TEXT,           -- in/out
+      direction TEXT,
       amount NUMERIC,
       description TEXT,
       payee TEXT,
@@ -84,55 +91,9 @@ async function initSchema(pool) {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+  await exec(pool, `CREATE INDEX IF NOT EXISTS idx_fin_chat_date ON public.financial_records(chat_id, date);`);
 
-  // FILES (anexos recebidos do Telegram)
-  await exec(pool, `
-    CREATE TABLE IF NOT EXISTS public.files (
-      id BIGSERIAL PRIMARY KEY,
-      chat_id BIGINT,
-      telegram_file_id TEXT,
-      file_name TEXT,
-      mime_type TEXT,
-      bytes BIGINT,
-      local_path TEXT,
-      sha256 TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-
-  // Índices: só cria se a coluna existir (nunca trava)
-  await exec(pool, `
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='events' AND column_name='chat_id'
-      ) THEN
-        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_events_chat ON public.events(chat_id);';
-      END IF;
-
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_schema='public' AND table_name='events' AND column_name='created_at'
-      ) THEN
-        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_events_time ON public.events(created_at);';
-      END IF;
-
-      EXECUTE 'CREATE INDEX IF NOT EXISTS idx_pending_chat ON public.pending_actions(chat_id);';
-      EXECUTE 'CREATE INDEX IF NOT EXISTS idx_fin_chat ON public.financial_records(chat_id);';
-      EXECUTE 'CREATE INDEX IF NOT EXISTS idx_fin_date ON public.financial_records(date);';
-    END $$;
-  `);
-
-  const cols = await exec(pool, `
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema='public' AND table_name='events'
-    ORDER BY ordinal_position;
-  `);
-
-  console.log("✅ public.events colunas:", cols.rows.map(r => r.column_name).join(", "));
-  console.log("✅ Banco OK (CEO mode)");
+  console.log("✅ Banco OK");
 }
 
 async function createDb() {

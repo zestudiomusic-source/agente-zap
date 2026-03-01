@@ -1,19 +1,10 @@
-// src/workflow.js (executa planos aprovados)
-const { sendEmail } = require("./email");
-const { generateSimplePDF } = require("./pdf");
-
-async function executePlan({ db, chatId, plan }) {
-  // Plano é JSON criado pela IA (com sua confirmação)
-  // Aqui é onde vira “real”.
-
+// src/workflow.js
+async function executePlan(db, chatId, plan) {
   const actions = Array.isArray(plan?.actions) ? plan.actions : [];
-
   const results = [];
 
   for (const a of actions) {
-    const type = a?.type;
-
-    if (type === "save_financial_records") {
+    if (a.type === "save_financial_records") {
       const rows = Array.isArray(a.records) ? a.records : [];
       for (const r of rows) {
         await db.exec(
@@ -27,8 +18,8 @@ async function executePlan({ db, chatId, plan }) {
             r.source || "manual",
             r.ref || null,
             r.date || null,
-            r.direction || null,
-            r.amount || null,
+            r.direction || "unknown",
+            r.amount ?? null,
             r.description || null,
             r.payee || null,
             r.category || null,
@@ -40,49 +31,36 @@ async function executePlan({ db, chatId, plan }) {
       continue;
     }
 
-    if (type === "generate_pdf") {
-      const pdfPath = await generateSimplePDF(a.title || "Documento", a.lines || []);
-      results.push(`PDF gerado: ${pdfPath}`);
-      continue;
-    }
-
-    if (type === "send_email") {
-      const ok = await sendEmail({
-        to: a.to,
-        subject: a.subject || "Documento",
-        text: a.text || "",
-        attachments: a.attachments || [],
-      });
-      results.push(ok ? `Email enviado para ${a.to}` : `Email NÃO enviado (email não configurado).`);
-      continue;
-    }
-
-    if (type === "save_rule") {
+    if (a.type === "save_rule") {
       if (a.rule) {
-        await db.exec(`INSERT INTO public.ai_rules(chat_id, rule, active) VALUES($1,$2,true)`, [
-          chatId,
-          a.rule,
-        ]);
+        await db.exec(
+          `INSERT INTO public.ai_rules(chat_id, rule, active) VALUES($1,$2,true)`,
+          [chatId, a.rule]
+        );
         results.push("Regra permanente salva.");
       }
       continue;
     }
 
-    results.push(`Ação ignorada (tipo desconhecido): ${type}`);
+    results.push(`Ação ignorada: ${a.type}`);
   }
 
   return results;
 }
 
-async function handleYesNo({ db, chatId, userText }) {
-  const txt = (userText || "").trim().toLowerCase();
+async function handleYesNo(db, chatId, textLower) {
+  const isYes = textLower === "sim" || textLower.startsWith("sim ");
+  const isNo =
+    textLower === "não" ||
+    textLower === "nao" ||
+    textLower.startsWith("não ") ||
+    textLower.startsWith("nao ");
 
-  if (txt !== "sim" && txt !== "não" && txt !== "nao") return null;
+  if (!isYes && !isNo) return null;
 
-  // pega a última pendência
   const r = await db.exec(
     `
-    SELECT id, plan, question
+    SELECT id, question, plan
     FROM public.pending_actions
     WHERE chat_id=$1 AND status='pending'
     ORDER BY id DESC
@@ -91,30 +69,29 @@ async function handleYesNo({ db, chatId, userText }) {
     [chatId]
   );
 
-  const pending = r.rows[0];
-  if (!pending) return "Não achei nenhuma ação pendente para confirmar.";
+  const p = r.rows[0];
+  if (!p) return "Não achei nada pendente para confirmar.";
 
-  if (txt === "não" || txt === "nao") {
+  if (isNo) {
     await db.exec(
       `UPDATE public.pending_actions SET status='rejected', decided_at=NOW() WHERE id=$1`,
-      [pending.id]
+      [p.id]
     );
-    return "Cancelado. Nenhuma ação foi executada.";
+    return "Ok. ❌ Cancelado. Nada foi salvo/executado.";
   }
 
-  // aprovado
   await db.exec(
     `UPDATE public.pending_actions SET status='approved', decided_at=NOW() WHERE id=$1`,
-    [pending.id]
+    [p.id]
   );
 
   try {
-    const results = await executePlan({ db, chatId, plan: pending.plan });
-    await db.exec(`UPDATE public.pending_actions SET status='done' WHERE id=$1`, [pending.id]);
-    return `Executado.\n- ${results.join("\n- ")}`;
+    const results = await executePlan(db, chatId, p.plan);
+    await db.exec(`UPDATE public.pending_actions SET status='done' WHERE id=$1`, [p.id]);
+    return `✅ Executado.\n- ${results.join("\n- ")}`;
   } catch (e) {
-    await db.exec(`UPDATE public.pending_actions SET status='error' WHERE id=$1`, [pending.id]);
-    return `Erro ao executar: ${e.message}`;
+    await db.exec(`UPDATE public.pending_actions SET status='error' WHERE id=$1`, [p.id]);
+    return `❌ Erro ao executar: ${e.message}`;
   }
 }
 

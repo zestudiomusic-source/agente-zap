@@ -1,6 +1,5 @@
 // src/server.js
 const express = require("express");
-const bodyParser = require("body-parser");
 const { createDb } = require("./db");
 const { handleTelegramUpdate } = require("./telegram");
 const { startSchedulers } = require("./schedulers");
@@ -16,27 +15,17 @@ if (!BOT_TOKEN) {
 async function main() {
   console.log("🚀 Iniciando ERP IA Central...");
 
-  // Banco de dados
   const db = await createDb();
   console.log("✅ Banco conectado");
 
-  // Servidor web (Webhook Telegram)
   const app = express();
-  app.use(bodyParser.json({ limit: "10mb" }));
+  app.use(express.json({ limit: "20mb" }));
 
-  // Rota de saúde (Render)
-  app.get("/", (req, res) => {
-    res.send("ERP IA Central rodando ✅");
-  });
+  app.get("/", (req, res) => res.send("ERP IA Central rodando ✅"));
 
-  // Webhook do Telegram (ESSENCIAL)
   app.post("/webhook", async (req, res) => {
     try {
-      const update = req.body;
-
-      // Processa qualquer mensagem dos grupos ADM e PRODUÇÃO
-      await handleTelegramUpdate(update, db);
-
+      await handleTelegramUpdate(req.body, db);
       res.sendStatus(200);
     } catch (err) {
       console.error("❌ Erro no webhook:", err);
@@ -44,7 +33,6 @@ async function main() {
     }
   });
 
-  // Inicia relatórios automáticos (diário e semanal)
   startSchedulers(db);
 
   app.listen(PORT, () => {
